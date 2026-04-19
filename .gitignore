@@ -1,0 +1,43 @@
+# Environment & secrets
+.env
+.env.*
+
+# Runtime data
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+
+# Wiki private tier
+wiki/private/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Claude Code + Codex session artifacts
+.tt/
+.discuss/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PM2
+.pm2/

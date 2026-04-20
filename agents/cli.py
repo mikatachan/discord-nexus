@@ -117,6 +117,7 @@ class ClaudeAgent(BaseAgent):
                 pass
 
     # Seconds of no stdout activity before treating the process as hung.
+    # Claude CLI emits partial messages during generation — 90s covers typical API response time.
     _ACTIVITY_TIMEOUT = 90
 
     async def call(
@@ -360,9 +361,11 @@ class CodexAgent(BaseAgent):
             await proc.stdin.drain()
             proc.stdin.close()
 
-            # Read JSONL events line by line. With --json, Codex emits events as it
-            # works — activity timeout is now meaningful (90s between events).
-            _ACTIVITY_TIMEOUT = 90
+            # Read JSONL events line by line. With --json, Codex emits events during tool
+            # calls but goes silent during model API response synthesis (same prefill issue
+            # as HTTP relays). 300s gives headroom for slow API responses while still
+            # catching genuine subprocess hangs.
+            _ACTIVITY_TIMEOUT = 300
             loop = asyncio.get_event_loop()
             deadline = loop.time() + effective_timeout
             last_activity = loop.time()

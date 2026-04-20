@@ -23,7 +23,7 @@ lmstudio:
 openclaw:
   base_url: "http://localhost:18789/v1"  # Your OpenClaw gateway URL
   agent_id: "main"                       # Workspace/agent ID in your OpenClaw config
-  timeout: 360                           # Seconds to wait for response
+  timeout: 600                           # Seconds to wait for response (raise for thinking models)
   # Auth token loaded from .env OPENCLAW_GATEWAY_TOKEN
 
 # ── Local LLM agent persona (Local Agent/YourLocalAgent) ──────────────────────────

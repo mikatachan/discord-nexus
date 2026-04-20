@@ -56,6 +56,41 @@ def _is_rate_limit(text: str) -> bool:
     return any(p in t for p in _RATE_LIMIT_PATTERNS)
 
 
+def _extract_codex_text(event: dict) -> str:
+    """Extract accumulated assistant text from a Codex --json event.
+
+    Codex JSONL event shapes (add new shapes here as discovered):
+      {"type": "agent_message", "message": {"role": "assistant", "content": [{"type": "text", "text": "..."}]}}
+      {"type": "message", "content": "..."}
+      {"type": "response.output_item.added", "item": {"type": "message", "content": [{"type": "output_text", "text": "..."}]}}
+    Returns the text found, or "" if none.
+    """
+    # Shape 1: agent_message / message with content list
+    msg = event.get("message") or event.get("item", {})
+    content = msg.get("content", []) if isinstance(msg, dict) else []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in ("text", "output_text"):
+                t = block.get("text", "")
+                if t:
+                    return t
+
+    # Shape 2: flat "content" string
+    flat = event.get("content")
+    if isinstance(flat, str) and flat:
+        return flat
+
+    # Shape 3: nested response.output with text
+    for item in event.get("response", {}).get("output", []):
+        for block in item.get("content", []):
+            if isinstance(block, dict):
+                t = block.get("text", "")
+                if t:
+                    return t
+
+    return ""
+
+
 class ClaudeAgent(BaseAgent):
     """Claude Code CLI agent via `claude -p`.
 
@@ -277,8 +312,6 @@ class CodexAgent(BaseAgent):
         self.work_dir = work_dir
         self._current_proc: asyncio.subprocess.Process | None = None
 
-    _ACTIVITY_TIMEOUT = 90
-
     async def call(
         self,
         messages: list[dict],
@@ -287,8 +320,13 @@ class CodexAgent(BaseAgent):
         workspace: str = "",
         work_dir: str | None = None,
         timeout: int | None = None,
+        on_chunk=None,
     ) -> tuple[str, dict]:
-        """Call Codex CLI with conversation history + system prompt."""
+        """Call Codex CLI with conversation history + system prompt.
+
+        Uses --json mode for JSONL event streaming. on_chunk(text) is called with
+        accumulated text as Codex generates. Activity timeout is 90s per event.
+        """
         prompt = self._build_prompt(messages, system_prompt, mission=mission, workspace=workspace)
         effective_dir = work_dir or self.work_dir
         effective_timeout = timeout or self.timeout
@@ -298,6 +336,7 @@ class CodexAgent(BaseAgent):
             "--skip-git-repo-check",
             "--sandbox", "danger-full-access",
             "--ephemeral",
+            "--json",  # JSONL event stream — enables streaming + token metadata
             "-",  # read prompt from stdin
         ]
         if effective_dir:
@@ -321,34 +360,62 @@ class CodexAgent(BaseAgent):
             await proc.stdin.drain()
             proc.stdin.close()
 
-            # Read stdout line by line with activity hang-detection.
+            # Read JSONL events line by line. With --json, Codex emits events as it
+            # works — activity timeout is now meaningful (90s between events).
+            _ACTIVITY_TIMEOUT = 90
             loop = asyncio.get_event_loop()
             deadline = loop.time() + effective_timeout
             last_activity = loop.time()
-            stdout_lines: list[str] = []
+
+            response_text = ""
+            last_chunk_sent = ""
+            tokens_used = 0
 
             while True:
                 now = loop.time()
                 if now >= deadline:
                     raise AgentTimeoutError(f"Codex exceeded total timeout of {effective_timeout}s")
-                read_timeout = min(self._ACTIVITY_TIMEOUT, deadline - now)
+                read_timeout = min(_ACTIVITY_TIMEOUT, deadline - now)
                 try:
                     raw = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
                 except asyncio.TimeoutError:
-                    if loop.time() - last_activity >= self._ACTIVITY_TIMEOUT:
+                    if loop.time() - last_activity >= _ACTIVITY_TIMEOUT:
                         raise AgentTimeoutError(
-                            f"Codex stopped responding (no activity for {self._ACTIVITY_TIMEOUT}s)"
+                            f"Codex stopped responding (no activity for {_ACTIVITY_TIMEOUT}s)"
                         )
                     continue
                 if not raw:
                     break
                 last_activity = loop.time()
-                stdout_lines.append(raw.decode("utf-8", errors="replace"))
+
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+
+                try:
+                    event = _json.loads(line)
+                except _json.JSONDecodeError:
+                    log.debug("Codex non-JSON line: %s", line[:120])
+                    continue
+
+                log.debug("Codex event: %s", event.get("type", ""))
+
+                partial_text = _extract_codex_text(event)
+                if partial_text and partial_text != last_chunk_sent:
+                    response_text = partial_text
+                    last_chunk_sent = partial_text
+                    if on_chunk is not None:
+                        await on_chunk(partial_text)
+
+                usage = event.get("usage") or event.get("response", {}).get("usage", {})
+                if usage:
+                    tokens_used = (
+                        usage.get("output_tokens") or usage.get("completion_tokens") or tokens_used
+                    )
 
             await proc.wait()
             err_data = await proc.stderr.read()
             err_output = err_data.decode("utf-8", errors="replace").replace("\r\n", "\n")
-            response_text = "".join(stdout_lines).replace("\r\n", "\n").replace("\r", "\n").strip()
 
             if proc.returncode != 0 and not response_text:
                 log.error("Codex CLI error (code %d): %s", proc.returncode, err_output[:200])
@@ -356,7 +423,6 @@ class CodexAgent(BaseAgent):
                     raise AgentRateLimitError(f"Codex usage/rate limit: {err_output[:200]}")
                 raise AgentOfflineError(f"Codex CLI failed: {err_output[:200]}")
 
-            tokens_used = self._extract_tokens(err_output)
             metadata = {"tokens_output": tokens_used or None}
             log.info(
                 "Codex — chars: %d, tokens: %d, exit: %d",

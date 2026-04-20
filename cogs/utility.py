@@ -237,6 +237,24 @@ class Utility(commands.Cog):
             "Dashboard posted. It will auto-update every 60 seconds."
         )
 
+    @app_commands.command(name="stop", description="Stop the agent currently running in this channel")
+    async def slash_stop(self, interaction: discord.Interaction):
+        if not self.bot.allowlist.is_allowed(interaction.user.id):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        agents_cog = self.bot.get_cog("Agents")
+        if not agents_cog:
+            await interaction.response.send_message("Agents cog not loaded.", ephemeral=True)
+            return
+        channel_key = str(interaction.channel_id)
+        agent = agents_cog._active_agents.get(channel_key)
+        if agent is None:
+            await interaction.response.send_message("No agent is running in this channel.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Stopping {agent.name}...", ephemeral=True)
+        agents_cog._active_agents.pop(channel_key, None)
+        await agent.kill()
+
     @app_commands.command(name="restart", description="Restart the bot process")
     async def slash_restart(self, interaction: discord.Interaction):
         if not self.bot.allowlist.is_allowed(interaction.user.id):

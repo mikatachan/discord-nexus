@@ -65,6 +65,10 @@ class OpenClawRelayAgent(BaseAgent):
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def kill(self) -> None:
+        """Abort any in-flight HTTP request by closing the session."""
+        await self.close()
+
     async def call(
         self,
         messages: list[dict],

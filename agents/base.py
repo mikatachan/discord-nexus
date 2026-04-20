@@ -29,6 +29,9 @@ class BaseAgent(ABC):
             AgentTimeoutError: If the agent doesn't respond within timeout.
         """
 
+    async def kill(self) -> None:
+        """Interrupt an in-progress call. No-op by default; override for subprocess/HTTP agents."""
+
     @abstractmethod
     async def health_check(self) -> dict:
         """Check if the agent backend is reachable.

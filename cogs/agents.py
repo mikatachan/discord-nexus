@@ -74,6 +74,8 @@ class Agents(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+        # channel_id (str) → agent currently running in that channel
+        self._active_agents: dict[str, object] = {}
 
     async def dispatch_agents(self, message: discord.Message) -> bool:
         """Handle agent @role mentions and !bang prefix dispatch.
@@ -341,6 +343,7 @@ class Agents(commands.Cog):
                 channel_id_str = str(resolve_channel_id(channel))
                 mission = self.bot._get_channel_mission(channel_id_str, agent_name)
 
+                self._active_agents[str(channel.id)] = agent
                 async with channel.typing():
                     # Wiki context — injected for conversational agents (not researcher)
                     wiki_context = ""
@@ -407,10 +410,9 @@ class Agents(commands.Cog):
                             system_prompt += f"\n\n## [Wiki Context]\n{wiki_context}"
                         if memory_block:
                             system_prompt += f"\n\n## [Remembered Facts]\n{memory_block}"
-                        # on_chunk streams partial text to the placeholder (Claude only —
-                        # CodexAgent doesn't support streaming).
+                        # on_chunk streams partial text to the placeholder as agent generates.
                         call_kwargs = {}
-                        if agent_name == "claude":
+                        if agent_name in ("claude", "codex"):
                             call_kwargs["on_chunk"] = _on_chunk
                         result = await agent.call(
                             history,
@@ -425,6 +427,8 @@ class Agents(commands.Cog):
                             ),
                             **call_kwargs,
                         )
+
+                    self._active_agents.pop(str(channel.id), None)
 
                     if isinstance(result, tuple):
                         response_text, metadata = result

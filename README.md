@@ -44,7 +44,8 @@ Discord Message
       ├── services/wiki.py         Flat-file wiki with public + private tiers
       ├── persistence/db.py        SQLite (aiosqlite) — history, jobs, memory, workspaces
       └── cogs/
-            ├── utility.py         /help, /monitor, /dashboard, /restart, slash agents
+            ├── utility.py         /help, /monitor, /dashboard, /restart, /stop, slash agents
+            ├── cron.py            /cron add|list|delete|enable|disable — scheduled agent prompts
             └── wiki.py            /wiki, /wiki-private, auto-ingest loop
 
 washer.py (scheduled, runs independently of bot.py)
@@ -123,6 +124,10 @@ In the Discord Developer Portal, enable the **Message Content Intent** and gener
 | Agent handoffs | Agents hand off tasks to each other via `@AgentName <task>` |
 | Per-thread history | Conversation history stored per thread per agent in SQLite |
 | Agent workspaces | Per-thread scratch state preserved across turns |
+| Live streaming | Claude and Codex stream partial output to a Discord placeholder as they generate |
+| Thread support | Agents work correctly in forum posts and thread channels via webhook routing |
+| /stop | Cancel a running agent mid-generation with a slash command |
+| Cron jobs | `/cron add` schedules recurring agent prompts on a cron expression |
 | Public wiki | Shared Markdown wiki, written by agents or users |
 | Private wiki | Separate tier for sensitive content, stored outside the repo |
 | Persistent memory | `washer.py` extracts facts/preferences/context from history via local LLM |

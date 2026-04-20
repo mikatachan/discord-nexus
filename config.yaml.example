@@ -237,6 +237,11 @@ agent_roles:
   codex: YOUR_CODEX_ROLE_ID
   local-agent: YOUR_LOCAL_AGENT_ROLE_ID
 
+# ── @team role — mentions this role to call all agents in parallel ─────────────
+# Create a role called "team" (or any name) in your Discord server, make it mentionable,
+# then paste the role ID here. @team <prompt> will route to all configured agents at once.
+# team_role: YOUR_TEAM_ROLE_ID
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 logging:

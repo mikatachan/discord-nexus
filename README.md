@@ -9,6 +9,7 @@ A modular Discord bot framework for connecting AI agents — Claude Code CLI, Co
 discord-nexus lets you run multiple AI agents in a Discord server where they can:
 
 - Respond to messages via role mention (`@Claude`, `@Local Agent`, `@Codex`) or slash command
+- Respond to `@team <prompt>` to call all agents simultaneously
 - Hand off tasks to each other with a simple `@AgentName <task>` protocol
 - Maintain per-thread conversation history and agent workspaces
 - Write to a shared wiki (public and private tiers)
@@ -107,6 +108,7 @@ In the Discord Developer Portal, enable the **Message Content Intent** and gener
 | Feature | Description |
 |---|---|
 | Multi-agent routing | Role mentions and slash commands route to the correct agent |
+| @team broadcast | Mention a configurable team role to call all agents in parallel |
 | Agent handoffs | Agents hand off tasks to each other via `@AgentName <task>` |
 | Per-thread history | Conversation history stored per thread per agent in SQLite |
 | Agent workspaces | Per-thread scratch state preserved across turns |

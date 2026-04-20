@@ -163,6 +163,9 @@ class NexusBot(discord_commands.Bot):
         self._agent_role_ids: dict[str, int] = {
             k: int(v) for k, v in config.get("agent_roles", {}).items()
         }
+        # @team role → all agents in parallel
+        _team_role_raw = config.get("team_role")
+        self._team_role_id: int | None = int(_team_role_raw) if _team_role_raw else None
 
         ch = config.get("channels", {})
         self.alerts_channel_id = ch.get("alerts", 0) or 0

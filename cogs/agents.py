@@ -26,7 +26,7 @@ import discord
 from discord.ext import commands
 
 from agents.base import AgentOfflineError, AgentRateLimitError, AgentTimeoutError
-from routing.dispatcher import parse_commands, resolve_channel_id, should_respond
+from routing.dispatcher import ALL_AGENTS, parse_commands, resolve_channel_id, should_respond
 from security.filter import scan_output
 from utils.chunker import chunk_message
 from utils.log import set_correlation, clear_correlation
@@ -80,6 +80,36 @@ class Agents(commands.Cog):
 
         Returns True if any agent was dispatched (consumed the message).
         """
+        # --- @team → all agents in parallel ---
+        team_role_id = getattr(self.bot, "_team_role_id", None)
+        if team_role_id and message.role_mentions:
+            if any(r.id == team_role_id for r in message.role_mentions):
+                content = message.content
+                for role in message.role_mentions:
+                    content = content.replace(role.mention, "")
+                prompt = content.strip()
+                if not prompt:
+                    await message.channel.send("Usage: @team <your question>")
+                    return True
+                channel_id = resolve_channel_id(message.channel)
+                active_agents = [
+                    a for a in ALL_AGENTS
+                    if should_respond(channel_id, self.bot.agent_channels.get(a, set()))
+                ]
+                if active_agents:
+                    thread_id = str(message.channel.id)
+                    await asyncio.gather(*[
+                        self.handle_agent_request(
+                            agent_name=agent_name,
+                            prompt=prompt,
+                            thread_id=thread_id,
+                            channel=message.channel,
+                            user_id=message.author.id,
+                        )
+                        for agent_name in active_agents
+                    ])
+                return True
+
         # --- @role mention routing ---
         agent_role_ids = getattr(self.bot, "_agent_role_ids", {})
         if agent_role_ids and message.role_mentions:

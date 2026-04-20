@@ -92,8 +92,13 @@ class ClaudeAgent(BaseAgent):
         workspace: str = "",
         work_dir: str | None = None,
         timeout: int | None = None,
+        on_chunk=None,
     ) -> tuple[str, dict]:
-        """Call Claude Code CLI with conversation history + system prompt via stream-json."""
+        """Call Claude Code CLI with conversation history + system prompt via stream-json.
+
+        on_chunk: optional async callable(accumulated_text: str) — called as partial
+        assistant messages arrive (via --include-partial-messages events).
+        """
         prompt = self._build_prompt(messages, system_prompt, mission=mission, workspace=workspace)
         effective_dir = work_dir or self.work_dir
         effective_timeout = timeout or self.timeout
@@ -155,7 +160,19 @@ class ClaudeAgent(BaseAgent):
                 except _json.JSONDecodeError:
                     continue
 
-                if event.get("type") == "result":
+                event_type = event.get("type")
+
+                if event_type == "assistant":
+                    # Partial message — stream accumulated text to Discord placeholder.
+                    if on_chunk is not None:
+                        content_blocks = event.get("message", {}).get("content", [])
+                        for block in content_blocks:
+                            if block.get("type") == "text":
+                                partial_text = block.get("text", "")
+                                if partial_text:
+                                    await on_chunk(partial_text)
+
+                elif event_type == "result":
                     result_text = event.get("result", "")
                     if event.get("subtype") == "error" or event.get("is_error"):
                         if _is_rate_limit(result_text):

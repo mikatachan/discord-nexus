@@ -407,6 +407,11 @@ class Agents(commands.Cog):
                             system_prompt += f"\n\n## [Wiki Context]\n{wiki_context}"
                         if memory_block:
                             system_prompt += f"\n\n## [Remembered Facts]\n{memory_block}"
+                        # on_chunk streams partial text to the placeholder (Claude only —
+                        # CodexAgent doesn't support streaming).
+                        call_kwargs = {}
+                        if agent_name == "claude":
+                            call_kwargs["on_chunk"] = _on_chunk
                         result = await agent.call(
                             history,
                             system_prompt,
@@ -418,6 +423,7 @@ class Agents(commands.Cog):
                                 if use_extended_timeout
                                 else None
                             ),
+                            **call_kwargs,
                         )
 
                     if isinstance(result, tuple):
@@ -887,6 +893,7 @@ class Agents(commands.Cog):
                 username=display_name,
                 avatar_url=avatar_url,
                 wait=True,
+                **self._thread_kwargs(channel),
             )
         except Exception:
             log.debug(
@@ -911,6 +918,7 @@ class Agents(commands.Cog):
             "display_name", agent_name.capitalize()
         )
         avatar_url = self.bot.agent_configs.get(agent_name, {}).get("avatar_url") or None
+        thread_kw = self._thread_kwargs(channel)
 
         first_chunk, *rest_chunks = chunks
 
@@ -919,38 +927,48 @@ class Agents(commands.Cog):
                 await placeholder_msg.edit(content=first_chunk)
             except discord.HTTPException:
                 await webhook.send(
-                    content=first_chunk, username=display_name, avatar_url=avatar_url
+                    content=first_chunk, username=display_name, avatar_url=avatar_url, **thread_kw
                 )
         else:
             await webhook.send(
-                content=first_chunk, username=display_name, avatar_url=avatar_url
+                content=first_chunk, username=display_name, avatar_url=avatar_url, **thread_kw
             )
 
         for chunk in rest_chunks:
-            await webhook.send(content=chunk, username=display_name, avatar_url=avatar_url)
+            await webhook.send(content=chunk, username=display_name, avatar_url=avatar_url, **thread_kw)
+
+    @staticmethod
+    def _thread_kwargs(channel) -> dict:
+        """Return {'thread': channel} for Discord threads; {} for regular channels.
+
+        Webhook posts to a thread require this kwarg — without it the message
+        goes to the parent channel instead of the thread.
+        """
+        return {"thread": channel} if isinstance(channel, discord.Thread) else {}
 
     async def _get_webhook(self, channel, agent_name: str) -> discord.Webhook:
         """Get or create a webhook for an agent in a channel.
 
-        Webhooks allow the bot to post messages with custom names and avatars
-        so each agent appears as a distinct Discord user.
+        Threads don't own webhooks — the webhook lives on the parent channel
+        and messages are routed into the thread via the 'thread' kwarg on send().
         """
-        key = (channel.id, agent_name)
+        webhook_channel = channel.parent if isinstance(channel, discord.Thread) else channel
+        key = (webhook_channel.id, agent_name)
         if key in self.bot._webhooks:
             return self.bot._webhooks[key]
 
         display_name = self.bot.agent_configs.get(agent_name, {}).get(
             "display_name", agent_name.capitalize()
         )
-        webhooks = await channel.webhooks()
+        webhooks = await webhook_channel.webhooks()
         for webhook in webhooks:
             if webhook.name == display_name:
                 self.bot._webhooks[key] = webhook
                 return webhook
 
-        webhook = await channel.create_webhook(name=display_name)
+        webhook = await webhook_channel.create_webhook(name=display_name)
         self.bot._webhooks[key] = webhook
-        log.info("Created %s webhook in #%s", display_name, channel.name)
+        log.info("Created %s webhook in #%s", display_name, webhook_channel.name)
         return webhook
 
     async def _send_as_agent(self, channel, agent_name: str, text: str):
@@ -960,12 +978,14 @@ class Agents(commands.Cog):
             "display_name", agent_name.capitalize()
         )
         avatar_url = self.bot.agent_configs.get(agent_name, {}).get("avatar_url") or None
+        thread_kw = self._thread_kwargs(channel)
 
         for chunk in chunk_message(text):
             await webhook.send(
                 content=chunk,
                 username=display_name,
                 avatar_url=avatar_url,
+                **thread_kw,
             )
 
 

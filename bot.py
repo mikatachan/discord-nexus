@@ -352,6 +352,7 @@ class NexusBot(discord_commands.Bot):
         # Core cogs (always loaded)
         cog_modules = [
             "cogs.agents",    # Agent dispatch and webhooks
+            "cogs.cron",      # /cron — scheduled recurring agent prompts
             "cogs.utility",   # /help, /monitor, /dashboard, agent slash commands
             "cogs.wiki",      # Wiki management and background curation
         ]

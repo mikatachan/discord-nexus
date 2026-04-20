@@ -244,6 +244,21 @@ CREATE TABLE IF NOT EXISTS wiki_references (
     marker_hash TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS cron_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    schedule TEXT NOT NULL,
+    channel_id INTEGER NOT NULL,
+    agent_name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    created_by INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run REAL,
+    next_run REAL NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cron_next_run ON cron_jobs(next_run);
 """
 
 _PRIVATE_SCHEMA = """
@@ -1066,6 +1081,60 @@ class Database:
     async def delete_wiki_reference(self, content_hash: str) -> bool:
         cursor = await self._db.execute(
             "DELETE FROM wiki_references WHERE content_hash = ?", (content_hash,)
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    # --- Cron Jobs ---
+
+    async def create_cron_job(
+        self,
+        name: str,
+        schedule: str,
+        channel_id: int,
+        agent_name: str,
+        prompt: str,
+        created_by: int,
+        next_run: float,
+    ) -> int:
+        now = time.time()
+        cursor = await self._db.execute(
+            "INSERT INTO cron_jobs (name, schedule, channel_id, agent_name, prompt, created_by, next_run, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, schedule, channel_id, agent_name, prompt, created_by, next_run, now),
+        )
+        await self._db.commit()
+        return cursor.lastrowid
+
+    async def list_cron_jobs(self) -> list[dict]:
+        cursor = await self._db.execute("SELECT * FROM cron_jobs ORDER BY name")
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_due_cron_jobs(self, now: float) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM cron_jobs WHERE enabled = 1 AND next_run <= ?",
+            (now,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def update_cron_job_run(self, job_id: int, last_run: float, next_run: float):
+        await self._db.execute(
+            "UPDATE cron_jobs SET last_run = ?, next_run = ? WHERE id = ?",
+            (last_run, next_run, job_id),
+        )
+        await self._db.commit()
+
+    async def delete_cron_job(self, name: str) -> bool:
+        cursor = await self._db.execute(
+            "DELETE FROM cron_jobs WHERE name = ?", (name,)
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    async def set_cron_job_enabled(self, name: str, enabled: bool) -> bool:
+        cursor = await self._db.execute(
+            "UPDATE cron_jobs SET enabled = ? WHERE name = ?",
+            (1 if enabled else 0, name),
         )
         await self._db.commit()
         return cursor.rowcount > 0

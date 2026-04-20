@@ -1,8 +1,4 @@
-"""CLI-based agents — Claude Code and Codex via subprocess.
-
-Supports both Windows (codex.cmd) and Mac/Linux (codex) automatically.
-Agents run as subprocesses and receive the prompt via stdin.
-"""
+"""CLI-based agents — Claude Code and Codex via subprocess."""
 
 import asyncio
 import json as _json
@@ -14,10 +10,9 @@ import sys
 
 from .base import AgentOfflineError, AgentRateLimitError, AgentTimeoutError, BaseAgent
 
-# On Windows, npm-installed CLIs require the .cmd extension for subprocess_exec.
+# On Windows, npm-installed CLIs need .cmd extension for subprocess_exec
 _IS_WIN = sys.platform == "win32"
 _CODEX_CMD = "codex.cmd" if _IS_WIN else "codex"
-# Suppress console windows on Windows (no effect on Mac/Linux)
 _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if _IS_WIN else {}
 
 log = logging.getLogger(__name__)
@@ -45,6 +40,12 @@ _STRIP_ENV_KEYS: frozenset[str] = frozenset({
     "OPENAI_API_KEY",
 })
 
+# Codex --json event types that carry no assistant text (suppress unmatched-event debug log)
+_CODEX_NON_TEXT_EVENTS: frozenset[str] = frozenset({
+    "thread.started", "turn.started", "turn.completed",
+    "item.started", "item.completed",
+})
+
 
 def _filtered_env() -> dict[str, str]:
     """Return os.environ minus keys that must not reach subprocess agents."""
@@ -57,16 +58,26 @@ def _is_rate_limit(text: str) -> bool:
 
 
 def _extract_codex_text(event: dict) -> str:
-    """Extract accumulated assistant text from a Codex --json event.
+    """Extract assistant text from a Codex --json JSONL event.
 
-    Codex JSONL event shapes (add new shapes here as discovered):
-      {"type": "agent_message", "message": {"role": "assistant", "content": [{"type": "text", "text": "..."}]}}
-      {"type": "message", "content": "..."}
-      {"type": "response.output_item.added", "item": {"type": "message", "content": [{"type": "output_text", "text": "..."}]}}
-    Returns the text found, or "" if none.
+    Confirmed shapes from codex-cli 0.120.0 (probed live):
+      item.completed: {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+      turn.completed: {"type":"turn.completed","usage":{...}}  ← no text, skip
+
+    Legacy shapes retained for forward/backward compat:
+      {"type":"agent_message","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
+      {"type":"message","content":"..."}
+      {"type":"response.output_item.added","item":{"type":"message","content":[{"type":"output_text","text":"..."}]}}
     """
-    # Shape 1: agent_message / message with content list
-    msg = event.get("message") or event.get("item", {})
+    # Shape 1 (primary — confirmed): item.completed with agent_message text
+    item = event.get("item", {})
+    if isinstance(item, dict) and item.get("type") == "agent_message":
+        t = item.get("text", "")
+        if t:
+            return t
+
+    # Shape 2 (legacy): agent_message/message with content list
+    msg = event.get("message") or item
     content = msg.get("content", []) if isinstance(msg, dict) else []
     if isinstance(content, list):
         for block in content:
@@ -75,14 +86,14 @@ def _extract_codex_text(event: dict) -> str:
                 if t:
                     return t
 
-    # Shape 2: flat "content" string
+    # Shape 3 (legacy): flat "content" string
     flat = event.get("content")
     if isinstance(flat, str) and flat:
         return flat
 
-    # Shape 3: nested response.output with text
-    for item in event.get("response", {}).get("output", []):
-        for block in item.get("content", []):
+    # Shape 4 (legacy): nested response.output with text
+    for out_item in event.get("response", {}).get("output", []):
+        for block in out_item.get("content", []):
             if isinstance(block, dict):
                 t = block.get("text", "")
                 if t:
@@ -92,17 +103,12 @@ def _extract_codex_text(event: dict) -> str:
 
 
 class ClaudeAgent(BaseAgent):
-    """Claude Code CLI agent via `claude -p`.
+    """Claude Code CLI agent via `claude -p`."""
 
-    Requires the Claude Code CLI to be installed and authenticated:
-      npm install -g @anthropic-ai/claude-code
-      claude auth
-    """
-
-    def __init__(self, timeout: int = 360, work_dir: str | None = None, model: str | None = None):
+    def __init__(self, timeout: int = 120, work_dir: str | None = None, model: str | None = None):
         super().__init__(name="Claude", timeout=timeout)
         self.work_dir = work_dir
-        self.model = model  # Optional: pin to specific model e.g. "claude-sonnet-4-6"
+        self.model = model  # e.g. "claude-sonnet-4-6" or "claude-opus-4-6"
         self._current_proc: asyncio.subprocess.Process | None = None
 
     async def kill(self) -> None:
@@ -116,32 +122,21 @@ class ClaudeAgent(BaseAgent):
             except Exception:
                 pass
 
-    # Seconds of no stdout activity before treating the process as hung.
-    # Claude CLI emits partial messages during generation — 90s covers typical API response time.
+    # Seconds of no stdout activity before we consider the process hung.
     _ACTIVITY_TIMEOUT = 90
 
-    async def call(
-        self,
-        messages: list[dict],
-        system_prompt: str,
-        mission: str = "",
-        workspace: str = "",
-        work_dir: str | None = None,
-        timeout: int | None = None,
-        on_chunk=None,
-    ) -> tuple[str, dict]:
-        """Call Claude Code CLI with conversation history + system prompt via stream-json.
-
-        on_chunk: optional async callable(accumulated_text: str) — called as partial
-        assistant messages arrive (via --include-partial-messages events).
-        """
+    async def call(self, messages: list[dict], system_prompt: str,
+                   mission: str = "", workspace: str = "",
+                   work_dir: str | None = None,
+                   timeout: int | None = None,
+                   on_chunk=None) -> tuple[str, dict]:
+        """Call Claude CLI. on_chunk(text) is called with accumulated text as partial messages arrive."""
         prompt = self._build_prompt(messages, system_prompt, mission=mission, workspace=workspace)
         effective_dir = work_dir or self.work_dir
         effective_timeout = timeout or self.timeout
 
         try:
-            cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json",
-                   "--include-partial-messages"]
+            cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages"]
             if self.model:
                 cmd += ["--model", self.model]
             proc = await asyncio.create_subprocess_exec(
@@ -155,16 +150,18 @@ class ClaudeAgent(BaseAgent):
             )
             self._current_proc = proc
 
-            # Write prompt to stdin then close.
+            # Write prompt to stdin then close — Claude reads it all before responding.
             proc.stdin.write(prompt.encode())
             await proc.stdin.drain()
             proc.stdin.close()
 
             # Read stream-json events line by line.
-            # Kill if no event for _ACTIVITY_TIMEOUT seconds (hung) OR wall-clock exceeded.
+            # Kill if no event arrives for _ACTIVITY_TIMEOUT seconds (hung detection)
+            # OR if total wall-clock exceeds effective_timeout.
             loop = asyncio.get_event_loop()
             deadline = loop.time() + effective_timeout
             last_activity = loop.time()
+
             response_text = ""
             metadata: dict = {}
 
@@ -174,10 +171,12 @@ class ClaudeAgent(BaseAgent):
                     raise AgentTimeoutError(
                         f"Claude exceeded total timeout of {effective_timeout}s"
                     )
+                # Wait at most _ACTIVITY_TIMEOUT or remaining wall-clock, whichever is shorter.
                 read_timeout = min(self._ACTIVITY_TIMEOUT, deadline - now)
                 try:
                     raw = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
                 except asyncio.TimeoutError:
+                    # Check whether this is an activity timeout or wall-clock timeout.
                     if loop.time() - last_activity >= self._ACTIVITY_TIMEOUT:
                         raise AgentTimeoutError(
                             f"Claude stopped responding (no activity for {self._ACTIVITY_TIMEOUT}s)"
@@ -185,7 +184,8 @@ class ClaudeAgent(BaseAgent):
                     continue
 
                 if not raw:
-                    break  # EOF
+                    break  # EOF — process finished
+
                 last_activity = loop.time()
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -209,8 +209,9 @@ class ClaudeAgent(BaseAgent):
                                     await on_chunk(partial_text)
 
                 elif event_type == "result":
+                    subtype = event.get("subtype", "")
                     result_text = event.get("result", "")
-                    if event.get("subtype") == "error" or event.get("is_error"):
+                    if subtype == "error" or event.get("is_error"):
                         if _is_rate_limit(result_text):
                             raise AgentRateLimitError(f"Claude usage/rate limit: {result_text[:200]}")
                         raise AgentOfflineError(f"Claude error: {result_text[:200]}")
@@ -241,9 +242,7 @@ class ClaudeAgent(BaseAgent):
             return response_text, metadata
 
         except FileNotFoundError:
-            raise AgentOfflineError(
-                "Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"
-            )
+            raise AgentOfflineError("Claude CLI not found. Is it installed?")
         finally:
             _proc = self._current_proc
             self._current_proc = None
@@ -267,13 +266,8 @@ class ClaudeAgent(BaseAgent):
         except Exception as e:
             return {"status": "offline", "error": str(e)}
 
-    def _build_prompt(
-        self,
-        messages: list[dict],
-        system_prompt: str,
-        mission: str = "",
-        workspace: str = "",
-    ) -> str:
+    def _build_prompt(self, messages: list[dict], system_prompt: str,
+                      mission: str = "", workspace: str = "") -> str:
         """Build 4-layer prompt: IDENTITY → MISSION → SCRATCH → HISTORY."""
         parts = []
 
@@ -299,52 +293,35 @@ class ClaudeAgent(BaseAgent):
 
 
 class CodexAgent(BaseAgent):
-    """Codex CLI agent via stdin pipe to `codex exec`.
+    """Codex CLI agent via stdin pipe to `codex exec`."""
 
-    Requires the Codex CLI to be installed and authenticated:
-      npm install -g @openai/codex
-      codex auth     (or set OPENAI_API_KEY)
-
-    Windows note: the CLI is installed as codex.cmd — this is handled automatically.
-    """
-
-    def __init__(self, timeout: int = 360, work_dir: str | None = None):
+    def __init__(self, timeout: int = 120, work_dir: str | None = None):
         super().__init__(name="Codex", timeout=timeout)
         self.work_dir = work_dir
         self._current_proc: asyncio.subprocess.Process | None = None
 
-    async def call(
-        self,
-        messages: list[dict],
-        system_prompt: str,
-        mission: str = "",
-        workspace: str = "",
-        work_dir: str | None = None,
-        timeout: int | None = None,
-        on_chunk=None,
-    ) -> tuple[str, dict]:
-        """Call Codex CLI with conversation history + system prompt.
-
-        Uses --json mode for JSONL event streaming. on_chunk(text) is called with
-        accumulated text as Codex generates. Activity timeout is 90s per event.
-        """
+    async def call(self, messages: list[dict], system_prompt: str,
+                   mission: str = "", workspace: str = "",
+                   work_dir: str | None = None,
+                   timeout: int | None = None,
+                   on_chunk=None) -> tuple[str, dict]:
         prompt = self._build_prompt(messages, system_prompt, mission=mission, workspace=workspace)
         effective_dir = work_dir or self.work_dir
         effective_timeout = timeout or self.timeout
 
-        cmd_args = [
-            _CODEX_CMD, "exec",
-            "--skip-git-repo-check",
-            "--sandbox", "danger-full-access",
-            "--ephemeral",
-            "--json",  # JSONL event stream — enables streaming + token metadata
-            "-",  # read prompt from stdin
-        ]
-        if effective_dir:
-            cmd_args.insert(2, "-C")
-            cmd_args.insert(3, effective_dir)
-
         try:
+            cmd_args = [
+                _CODEX_CMD, "exec",
+                "--skip-git-repo-check",
+                "--sandbox", "danger-full-access",
+                "--ephemeral",
+                "--json",  # JSONL event stream — enables streaming + token metadata
+                "-",
+            ]
+            if effective_dir:
+                cmd_args.insert(2, "-C")
+                cmd_args.insert(3, effective_dir)
+
             proc = await asyncio.create_subprocess_exec(
                 *cmd_args,
                 stdin=asyncio.subprocess.PIPE,
@@ -361,18 +338,21 @@ class CodexAgent(BaseAgent):
             await proc.stdin.drain()
             proc.stdin.close()
 
-            # Read JSONL events line by line. With --json, Codex emits events during tool
-            # calls but goes silent during model API response synthesis (same prefill issue
-            # as HTTP relays). 300s gives headroom for slow API responses while still
-            # catching genuine subprocess hangs.
+            # Read JSONL events line by line.
+            # With --json, Codex emits events during tool calls, but goes silent during model API
+            # response synthesis (same prefill problem as HTTP relays). 300s gives headroom for slow
+            # API responses while still catching genuine subprocess hangs.
             _ACTIVITY_TIMEOUT = 300
             loop = asyncio.get_event_loop()
             deadline = loop.time() + effective_timeout
             last_activity = loop.time()
 
             response_text = ""
-            last_chunk_sent = ""
+            last_chunk_sent = ""  # track last text sent to on_chunk to avoid re-sending
             tokens_used = 0
+            tokens_input = 0
+            tokens_cache_read = 0
+            metadata: dict = {}
 
             while True:
                 now = loop.time()
@@ -398,45 +378,53 @@ class CodexAgent(BaseAgent):
                 try:
                     event = _json.loads(line)
                 except _json.JSONDecodeError:
+                    # Non-JSON line — log and skip (shouldn't happen in --json mode)
                     log.debug("Codex non-JSON line: %s", line[:120])
                     continue
 
-                log.debug("Codex event: %s", event.get("type", ""))
+                event_type = event.get("type", "")
+                log.debug("Codex event: %s", event_type)
 
+                # Extract text from known event shapes.
                 partial_text = _extract_codex_text(event)
+                if not partial_text and event_type and event_type not in _CODEX_NON_TEXT_EVENTS:
+                    # Truly unknown shape — log full event at DEBUG so we can add support for it.
+                    log.debug("Codex unmatched event (%s): %s", event_type, str(event)[:300])
                 if partial_text and partial_text != last_chunk_sent:
-                    response_text = partial_text
+                    response_text = partial_text  # Codex events carry accumulated text
                     last_chunk_sent = partial_text
                     if on_chunk is not None:
                         await on_chunk(partial_text)
 
+                # Token counts from turn.completed: input_tokens, cached_input_tokens, output_tokens
                 usage = event.get("usage") or event.get("response", {}).get("usage", {})
                 if usage:
-                    tokens_used = (
-                        usage.get("output_tokens") or usage.get("completion_tokens") or tokens_used
-                    )
+                    tokens_used = usage.get("output_tokens") or usage.get("completion_tokens") or tokens_used
+                    tokens_input = usage.get("input_tokens") or tokens_input
+                    tokens_cache_read = usage.get("cached_input_tokens") or tokens_cache_read
 
             await proc.wait()
             err_data = await proc.stderr.read()
             err_output = err_data.decode("utf-8", errors="replace").replace("\r\n", "\n")
 
-            if proc.returncode != 0 and not response_text:
-                log.error("Codex CLI error (code %d): %s", proc.returncode, err_output[:200])
-                if _is_rate_limit(err_output):
-                    raise AgentRateLimitError(f"Codex usage/rate limit: {err_output[:200]}")
-                raise AgentOfflineError(f"Codex CLI failed: {err_output[:200]}")
+            if proc.returncode != 0:
+                log.error("Codex CLI non-zero exit (code %d): %s", proc.returncode, err_output[:200])
+                if not response_text:
+                    if _is_rate_limit(err_output):
+                        raise AgentRateLimitError(f"Codex usage/rate limit: {err_output[:200]}")
+                    raise AgentOfflineError(f"Codex CLI failed: {err_output[:200]}")
+                # Partial output present — return it but the error is already logged above.
 
-            metadata = {"tokens_output": tokens_used or None}
-            log.info(
-                "Codex — chars: %d, tokens: %d, exit: %d",
-                len(response_text), tokens_used, proc.returncode,
-            )
+            metadata = {
+                "tokens_output": tokens_used or None,
+                "tokens_input": tokens_input or None,
+                "tokens_cache_read": tokens_cache_read or None,
+            }
+            log.info("Codex — chars: %d, tokens: %d, exit: %d", len(response_text), tokens_used, proc.returncode)
             return response_text, metadata
 
         except FileNotFoundError:
-            raise AgentOfflineError(
-                f"Codex CLI not found ({_CODEX_CMD}). Install: npm install -g @openai/codex"
-            )
+            raise AgentOfflineError("Codex CLI not found. Is it installed?")
         finally:
             _proc = self._current_proc
             self._current_proc = None
@@ -471,28 +459,23 @@ class CodexAgent(BaseAgent):
         except Exception as e:
             return {"status": "offline", "error": str(e)}
 
-    def _build_prompt(
-        self,
-        messages: list[dict],
-        system_prompt: str,
-        mission: str = "",
-        workspace: str = "",
-    ) -> str:
+    def _build_prompt(self, messages: list[dict], system_prompt: str,
+                      mission: str = "", workspace: str = "") -> str:
         """Build 4-layer prompt: IDENTITY → MISSION → SCRATCH → HISTORY."""
         parts = []
 
-        # Layer 1: IDENTITY
+        # Layer 1: IDENTITY (system prompt)
         parts.append(system_prompt)
 
-        # Layer 2: MISSION
+        # Layer 2: MISSION (per-channel north star, if any)
         if mission:
             parts.append(f"\n## MISSION\n{mission}")
 
-        # Layer 3: SCRATCH
+        # Layer 3: SCRATCH (agent's own working notes from previous turns)
         if workspace:
             parts.append(f"\n## [{self.name} working notes]\n{workspace}")
 
-        parts.append("")
+        parts.append("")  # blank line separator before history
 
         # Layer 4: HISTORY
         for msg in messages:
@@ -507,3 +490,34 @@ class CodexAgent(BaseAgent):
         if tok_match:
             return int(tok_match.group(1).replace(",", ""))
         return 0
+
+    def _extract_response(self, output: str) -> tuple[str, int]:
+        """Extract the actual response and token count from Codex CLI output.
+
+        Returns (response_text, tokens_used).
+        Codex prints a header block (version, model, settings) followed by
+        the actual response and optionally a 'tokens used\\nN,NNN' footer.
+        """
+        lines = output.split("\n")
+
+        # Find the last 'codex' marker line — response follows
+        codex_idx = None
+        for i, line in enumerate(lines):
+            if line.strip() == "codex":
+                codex_idx = i
+
+        if codex_idx is not None and codex_idx + 1 < len(lines):
+            response = "\n".join(lines[codex_idx + 1:]).strip()
+        else:
+            response = output
+
+        # Extract and strip token count: pattern is "\ntokens used\nN,NNN" at end
+        tokens_int = 0
+        tok_match = re.search(r"\ntokens used\n([\d,]+)", response)
+        if tok_match:
+            tokens_int = int(tok_match.group(1).replace(",", ""))
+            response = response[:tok_match.start()].strip()
+        elif response.endswith("tokens used"):
+            response = response.rsplit("\ntokens used", 1)[0].strip()
+
+        return response, tokens_int

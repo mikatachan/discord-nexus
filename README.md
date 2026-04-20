@@ -15,6 +15,7 @@ discord-nexus lets you run multiple AI agents in a Discord server where they can
 - Write to a shared wiki (public and private tiers)
 - Post discoveries to a shared channel
 - Trigger web research tasks
+- Extract and inject persistent memories from conversation history (via `washer.py`)
 
 Each agent posts as a distinct Discord user via webhook, with its own name and avatar.
 
@@ -35,16 +36,26 @@ Discord Message
       │     Orchestrates agent calls, tag processing, handoffs, webhooks
       │
       ├── agents/
-      │     ├── cli.py          ClaudeAgent, CodexAgent (subprocess)
-      │     ├── local_llm.py    LocalLLMAgent (HTTP, OpenAI-compatible)
+      │     ├── cli.py             ClaudeAgent, CodexAgent (subprocess)
+      │     ├── local_llm.py       LocalLLMAgent (HTTP, OpenAI-compatible)
       │     ├── openclaw_relay.py  OpenClawRelayAgent (optional gateway)
-      │     └── researcher.py   ResearcherAgent (optional, web research)
+      │     └── researcher.py      ResearcherAgent (optional, web research)
       │
-      ├── services/wiki.py      Flat-file wiki with public + private tiers
-      ├── persistence/db.py     SQLite (aiosqlite) — history, jobs, workspaces
+      ├── services/wiki.py         Flat-file wiki with public + private tiers
+      ├── persistence/db.py        SQLite (aiosqlite) — history, jobs, memory, workspaces
       └── cogs/
-            ├── utility.py      /help, /monitor, /dashboard, /restart, slash agents
-            └── wiki.py         /wiki, /wiki-private, auto-ingest loop
+            ├── utility.py         /help, /monitor, /dashboard, /restart, slash agents
+            └── wiki.py            /wiki, /wiki-private, auto-ingest loop
+
+washer.py (scheduled, runs independently of bot.py)
+      │
+      ├── Reads conversations + conversations_archive (watermark-based)
+      ├── Calls local LLM (LM Studio) for memory extraction
+      ├── memory/content_validator.py  — filters secrets + validates types
+      └── Routes to:
+            ├── persistence/db.py → memories          (fact)
+            ├── persistence/db.py → memory_promotions (preference/context)
+            └── private DB        → review_queue      (is_private=true)
 ```
 
 Agent output is scanned for structured tags (`<!-- DISCOVERY: -->`, `<!-- WIKI: -->`, etc.)
@@ -114,6 +125,8 @@ In the Discord Developer Portal, enable the **Message Content Intent** and gener
 | Agent workspaces | Per-thread scratch state preserved across turns |
 | Public wiki | Shared Markdown wiki, written by agents or users |
 | Private wiki | Separate tier for sensitive content, stored outside the repo |
+| Persistent memory | `washer.py` extracts facts/preferences/context from history via local LLM |
+| Private review queue | Sensitive extractions held for manual approval before injection |
 | Discoveries | Agents post notable findings to a shared channel |
 | Web research | Optional researcher agent triggers search queries |
 | Secret redaction | Output is scanned for secrets before posting |
@@ -121,6 +134,35 @@ In the Discord Developer Portal, enable the **Message Content Intent** and gener
 | Rate-limit fallback | If Claude is rate-limited, falls back to Codex, then local LLM |
 | Cross-platform | Windows and Mac/Linux supported |
 | PM2 ready | `ecosystem.config.js` included for persistent operation |
+
+---
+
+## Memory Washing Machine
+
+`washer.py` is an optional nightly pipeline that harvests durable memories from your conversation history using a local LLM (LM Studio / Ollama).
+
+It reads from `conversations` and `conversations_archive`, calls the local model for extraction, and routes results to three tiers:
+
+- **Shared memories** (`fact` type) — injected into all agent prompts
+- **Shared promotions** (`preference` / `context`) — queued for review before injection
+- **Private review queue** — `is_private` items go here; reviewed and approved via CLI
+
+**Setup:**
+```
+# .env
+TARGET_USER_ID=your_discord_user_id
+USER_DISPLAY_NAME=YourName
+E4B_BASE_URL=http://localhost:1234/v1
+E4B_MODEL=gemma-3-4b-it
+
+# Schedule (Windows)
+python scripts/setup-scheduler.ps1
+
+# Schedule (Linux/macOS — add to crontab)
+# 0 2 * * * cd /path/to/discord-nexus && python washer.py
+```
+
+The memory washing machine concept is from **Mark Kashef** — ["I Tried OpenClaw and Hermes. I Kept Claude Code."](https://youtu.be/rVzGu5OYYS0) (timestamp 10:57).
 
 ---
 
@@ -182,35 +224,6 @@ If you find this useful, donations are appreciated:
 - **BTC:** `bc1qyqx8eqlzpjvp3nnmgpfltq5p5vj43z5tqt553y`
 - **SOL:** `FxM3HmqJFNErRr3MFiPbAL9ojpuActaQ1h6TfH9fUPs2`
 - **ETH:** `0x55BF0d4a4185F6905268E503f4E64ecc5fB8538f`
-
----
-
-## Memory Washing Machine
-
-`washer.py` is an optional nightly pipeline that harvests durable memories from your conversation history using a local LLM (LM Studio / Ollama).
-
-It reads from `conversations` and `conversations_archive`, calls the local model for extraction, and routes results to three tiers:
-
-- **Shared memories** (`fact` type) — injected into all agent prompts
-- **Shared promotions** (`preference` / `context`) — queued for review before injection
-- **Private review queue** — `is_private` items go here; reviewed and approved via CLI
-
-**Setup:**
-```
-# .env
-TARGET_USER_ID=your_discord_user_id
-USER_DISPLAY_NAME=YourName
-E4B_BASE_URL=http://localhost:1234/v1
-E4B_MODEL=gemma-3-4b-it
-
-# Schedule (Windows)
-python scripts/setup-scheduler.ps1
-
-# Schedule (Linux/macOS — add to crontab)
-# 0 2 * * * cd /path/to/discord-nexus && python washer.py
-```
-
-The memory washing machine concept is from **Mark Kashef** — ["I Tried OpenClaw and Hermes. I Kept Claude Code."](https://youtu.be/rVzGu5OYYS0) (timestamp 10:57).
 
 ---
 

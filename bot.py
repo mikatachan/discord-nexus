@@ -182,6 +182,7 @@ class NexusBot(discord_commands.Bot):
         self._webhooks: dict[tuple[int, str], discord.Webhook] = {}
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._log_last_sent = 0.0
+        self._active_tasks: dict[str, asyncio.Task] = {}  # message_id -> dispatch task
         self._agent_status: dict[str, bool] = {}
         self._cleanup_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
@@ -460,8 +461,46 @@ class NexusBot(discord_commands.Bot):
 
         # Dispatch agent commands (!bang, @role mentions)
         agents_cog = self.get_cog("Agents")
-        if agents_cog and await agents_cog.dispatch_agents(message):
+        if agents_cog:
+            task = asyncio.create_task(agents_cog.dispatch_agents(message))
+            self._active_tasks[str(message.id)] = task
+            try:
+                handled = await task
+            except asyncio.CancelledError:
+                handled = True
+            finally:
+                self._active_tasks.pop(str(message.id), None)
+            if handled:
+                return
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        """Cancel in-flight agent request and reprocess if message content changed."""
+        if before.content == after.content:
             return
+        if after.webhook_id or after.author.bot:
+            return
+        if not self.allowlist.is_allowed(after.author.id):
+            return
+
+        task = self._active_tasks.pop(str(before.id), None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            for agent in self.agents.values():
+                if hasattr(agent, "kill"):
+                    try:
+                        await agent.kill()
+                    except Exception:
+                        pass
+            try:
+                await after.channel.send("↩️ Cancelled — reprocessing edited message...")
+            except Exception:
+                pass
+
+        await self.on_message(after)
 
     # --- Logging ---
 

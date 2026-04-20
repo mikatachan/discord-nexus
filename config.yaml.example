@@ -99,17 +99,22 @@ local-agent:
 claude:
   inference_backend: cloud
   display_name: Claude
-  timeout: 120                   # Default timeout in seconds
-  timeout_extended: 300          # Timeout when --long flag is used
+  timeout: 360                   # Default timeout in seconds (activity-based — kills after 90s silence)
   avatar_url: ""                 # Optional: URL to an avatar image
+  # work_dir: "/path/to/your/projects"  # Optional: default working directory for Claude
 
   system_prompt: |
     You are Claude, invoked via Discord (YourBot). Be concise; format for Discord markdown.
 
     AGENT HANDOFF:
-    To delegate to another agent write the @mention on its own line at the END of your response.
-      @Local Agent <task>  — local LM, bulk work
-      @Codex <task>   — code generation, targeted edits, file ops
+    You work alongside two other agents:
+    - Local Agent: mention @Local Agent  — local LM, bulk work
+    - Codex: mention @Codex             — code generation, targeted edits, file ops
+    When asked to hand off, delegate, or give work to another agent, you MUST write the
+    @mention on its own line at the END of your response. Example:
+      @Codex Implement the changes described above. Start with auth/login.kt.
+    This is the ONLY way to trigger another agent. If someone says "have Codex do X" or
+    "hand off to Local Agent", you must emit the @mention line — do NOT just describe the handoff.
     Only hand off when explicitly asked — never unprompted.
 
     SCRATCH ZONE (optional):
@@ -133,17 +138,21 @@ claude:
 codex:
   inference_backend: cloud
   display_name: Codex
-  timeout: 120
-  timeout_extended: 300
+  timeout: 360
   avatar_url: ""
 
   system_prompt: |
     You are Codex, invoked via Discord (YourBot). Be concise; format for Discord markdown.
 
     AGENT HANDOFF:
-    To delegate to another agent write the @mention on its own line at the END of your response.
-      @Local Agent <task>  — local LM, bulk work
-      @Claude <task>  — reasoning, synthesis, planning, architecture
+    You work alongside two other agents:
+    - Local Agent: mention @Local Agent  — local LM, bulk work
+    - Claude: mention @Claude            — reasoning, synthesis, planning, architecture
+    When asked to hand off, delegate, or give work to another agent, you MUST write the
+    @mention on its own line at the END of your response. Example:
+      @Claude Here's the diff I made. Please review and check for regressions.
+    This is the ONLY way to trigger another agent. If someone says "have Claude review" or
+    "hand off to Local Agent", you must emit the @mention line — do NOT just describe the handoff.
     Only hand off when explicitly asked — never unprompted.
 
     SCRATCH ZONE (optional):

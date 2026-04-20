@@ -171,6 +171,9 @@ class OpenClawRelayAgent(BaseAgent):
             }
             return response_text, metadata
 
+    # Seconds of SSE silence before treating the connection as hung.
+    _ACTIVITY_TIMEOUT = 90
+
     async def _call_openclaw_streaming(
         self,
         messages: list[dict],
@@ -180,6 +183,10 @@ class OpenClawRelayAgent(BaseAgent):
         session = await self._get_session()
         accumulated: list[str] = []
         usage: dict = {}
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self.timeout
+        last_activity = loop.time()
 
         async with session.post(
             f"{self.base_url}/chat/completions",
@@ -196,7 +203,26 @@ class OpenClawRelayAgent(BaseAgent):
                     f"OpenClaw gateway returned {resp.status}: {body[:200]}"
                 )
 
-            async for raw_line in resp.content:
+            while True:
+                now = loop.time()
+                if now >= deadline:
+                    raise AgentTimeoutError(
+                        f"{self.name} exceeded total timeout of {self.timeout}s"
+                    )
+                read_timeout = min(self._ACTIVITY_TIMEOUT, deadline - now)
+                try:
+                    raw_line = await asyncio.wait_for(
+                        resp.content.readline(), timeout=read_timeout
+                    )
+                except asyncio.TimeoutError:
+                    if loop.time() - last_activity >= self._ACTIVITY_TIMEOUT:
+                        raise AgentTimeoutError(
+                            f"{self.name} stopped responding (no activity for {self._ACTIVITY_TIMEOUT}s)"
+                        )
+                    continue
+                if not raw_line:
+                    break
+                last_activity = loop.time()
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line or not line.startswith("data: "):
                     continue

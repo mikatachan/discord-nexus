@@ -883,7 +883,7 @@ class Agents(commands.Cog):
             )
             avatar_url = self.bot.agent_configs.get(agent_name, {}).get("avatar_url") or None
             return await webhook.send(
-                content="*thinking...*",
+                content="🔄 thinking...",
                 username=display_name,
                 avatar_url=avatar_url,
                 wait=True,

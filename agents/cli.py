@@ -64,10 +64,25 @@ class ClaudeAgent(BaseAgent):
       claude auth
     """
 
-    def __init__(self, timeout: int = 120, work_dir: str | None = None, model: str | None = None):
+    def __init__(self, timeout: int = 360, work_dir: str | None = None, model: str | None = None):
         super().__init__(name="Claude", timeout=timeout)
         self.work_dir = work_dir
         self.model = model  # Optional: pin to specific model e.g. "claude-sonnet-4-6"
+        self._current_proc: asyncio.subprocess.Process | None = None
+
+    async def kill(self) -> None:
+        """Kill the currently running subprocess if any. No-op if idle."""
+        if self._current_proc is not None:
+            proc = self._current_proc
+            self._current_proc = None
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+
+    # Seconds of no stdout activity before treating the process as hung.
+    _ACTIVITY_TIMEOUT = 90
 
     async def call(
         self,
@@ -78,13 +93,14 @@ class ClaudeAgent(BaseAgent):
         work_dir: str | None = None,
         timeout: int | None = None,
     ) -> tuple[str, dict]:
-        """Call Claude Code CLI with conversation history + system prompt."""
+        """Call Claude Code CLI with conversation history + system prompt via stream-json."""
         prompt = self._build_prompt(messages, system_prompt, mission=mission, workspace=workspace)
         effective_dir = work_dir or self.work_dir
         effective_timeout = timeout or self.timeout
 
         try:
-            cmd = ["claude", "-p", "--output-format", "json"]
+            cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json",
+                   "--include-partial-messages"]
             if self.model:
                 cmd += ["--model", self.model]
             proc = await asyncio.create_subprocess_exec(
@@ -96,37 +112,72 @@ class ClaudeAgent(BaseAgent):
                 env=_filtered_env(),
                 **_NO_WINDOW,
             )
+            self._current_proc = proc
 
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()),
-                timeout=effective_timeout,
-            )
+            # Write prompt to stdin then close.
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
 
-            output = stdout.decode().strip()
-            metadata = {}
-            response_text = output
+            # Read stream-json events line by line.
+            # Kill if no event for _ACTIVITY_TIMEOUT seconds (hung) OR wall-clock exceeded.
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + effective_timeout
+            last_activity = loop.time()
+            response_text = ""
+            metadata: dict = {}
 
-            if proc.returncode != 0:
-                err = stderr.decode().strip()
-                log.error("Claude CLI error (code %d): %s", proc.returncode, err)
-                if not output:
-                    if _is_rate_limit(err) or _is_rate_limit(output):
-                        raise AgentRateLimitError(f"Claude usage/rate limit: {err[:200]}")
-                    raise AgentOfflineError(f"Claude CLI failed: {err[:200]}")
+            while True:
+                now = loop.time()
+                if now >= deadline:
+                    raise AgentTimeoutError(
+                        f"Claude exceeded total timeout of {effective_timeout}s"
+                    )
+                read_timeout = min(self._ACTIVITY_TIMEOUT, deadline - now)
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
+                except asyncio.TimeoutError:
+                    if loop.time() - last_activity >= self._ACTIVITY_TIMEOUT:
+                        raise AgentTimeoutError(
+                            f"Claude stopped responding (no activity for {self._ACTIVITY_TIMEOUT}s)"
+                        )
+                    continue
 
-            try:
-                data = _json.loads(output)
-                response_text = data.get("result", output)
-                if data.get("is_error") and _is_rate_limit(response_text):
-                    raise AgentRateLimitError(f"Claude usage/rate limit: {response_text[:200]}")
-                metadata = {
-                    "tokens_input": data.get("usage", {}).get("input_tokens"),
-                    "tokens_output": data.get("usage", {}).get("output_tokens"),
-                    "tokens_cache_read": data.get("usage", {}).get("cache_read_input_tokens"),
-                    "cost_usd": data.get("total_cost_usd"),
-                }
-            except (_json.JSONDecodeError, KeyError):
-                log.warning("Claude output was not JSON — token data unavailable")
+                if not raw:
+                    break  # EOF
+                last_activity = loop.time()
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+
+                try:
+                    event = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+
+                if event.get("type") == "result":
+                    result_text = event.get("result", "")
+                    if event.get("subtype") == "error" or event.get("is_error"):
+                        if _is_rate_limit(result_text):
+                            raise AgentRateLimitError(f"Claude usage/rate limit: {result_text[:200]}")
+                        raise AgentOfflineError(f"Claude error: {result_text[:200]}")
+                    response_text = result_text
+                    usage = event.get("usage", {})
+                    metadata = {
+                        "tokens_input": usage.get("input_tokens"),
+                        "tokens_output": usage.get("output_tokens"),
+                        "tokens_cache_read": usage.get("cache_read_input_tokens"),
+                        "cost_usd": event.get("total_cost_usd"),
+                    }
+
+            await proc.wait()
+
+            if not response_text and proc.returncode != 0:
+                stderr_data = await proc.stderr.read()
+                err = stderr_data.decode().strip()
+                if _is_rate_limit(err):
+                    raise AgentRateLimitError(f"Claude usage/rate limit: {err[:200]}")
+                raise AgentOfflineError(f"Claude CLI failed (code {proc.returncode}): {err[:200]}")
 
             log.info(
                 "Claude — chars: %d, cost: $%.4f, exit: %d",
@@ -140,9 +191,14 @@ class ClaudeAgent(BaseAgent):
             raise AgentOfflineError(
                 "Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"
             )
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise AgentTimeoutError(f"Claude did not respond within {effective_timeout}s")
+        finally:
+            _proc = self._current_proc
+            self._current_proc = None
+            if _proc is not None and _proc.returncode is None:
+                try:
+                    _proc.kill()
+                except Exception:
+                    pass
 
     async def health_check(self) -> dict:
         try:
@@ -199,10 +255,12 @@ class CodexAgent(BaseAgent):
     Windows note: the CLI is installed as codex.cmd — this is handled automatically.
     """
 
-    def __init__(self, timeout: int = 120, work_dir: str | None = None):
+    def __init__(self, timeout: int = 360, work_dir: str | None = None):
         super().__init__(name="Codex", timeout=timeout)
         self.work_dir = work_dir
         self._current_proc: asyncio.subprocess.Process | None = None
+
+    _ACTIVITY_TIMEOUT = 90
 
     async def call(
         self,
@@ -241,17 +299,43 @@ class CodexAgent(BaseAgent):
             )
             self._current_proc = proc
 
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()),
-                timeout=effective_timeout,
-            )
+            # Write prompt to stdin then close.
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
 
-            response_text = stdout.decode().replace("\r\n", "\n").replace("\r", "\n").strip()
-            err_output = stderr.decode().replace("\r\n", "\n").replace("\r", "\n")
+            # Read stdout line by line with activity hang-detection.
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + effective_timeout
+            last_activity = loop.time()
+            stdout_lines: list[str] = []
+
+            while True:
+                now = loop.time()
+                if now >= deadline:
+                    raise AgentTimeoutError(f"Codex exceeded total timeout of {effective_timeout}s")
+                read_timeout = min(self._ACTIVITY_TIMEOUT, deadline - now)
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
+                except asyncio.TimeoutError:
+                    if loop.time() - last_activity >= self._ACTIVITY_TIMEOUT:
+                        raise AgentTimeoutError(
+                            f"Codex stopped responding (no activity for {self._ACTIVITY_TIMEOUT}s)"
+                        )
+                    continue
+                if not raw:
+                    break
+                last_activity = loop.time()
+                stdout_lines.append(raw.decode("utf-8", errors="replace"))
+
+            await proc.wait()
+            err_data = await proc.stderr.read()
+            err_output = err_data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+            response_text = "".join(stdout_lines).replace("\r\n", "\n").replace("\r", "\n").strip()
 
             if proc.returncode != 0 and not response_text:
                 log.error("Codex CLI error (code %d): %s", proc.returncode, err_output[:200])
-                if _is_rate_limit(err_output) or _is_rate_limit(response_text):
+                if _is_rate_limit(err_output):
                     raise AgentRateLimitError(f"Codex usage/rate limit: {err_output[:200]}")
                 raise AgentOfflineError(f"Codex CLI failed: {err_output[:200]}")
 
@@ -267,11 +351,14 @@ class CodexAgent(BaseAgent):
             raise AgentOfflineError(
                 f"Codex CLI not found ({_CODEX_CMD}). Install: npm install -g @openai/codex"
             )
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise AgentTimeoutError(f"Codex did not respond within {effective_timeout}s")
         finally:
+            _proc = self._current_proc
             self._current_proc = None
+            if _proc is not None and _proc.returncode is None:
+                try:
+                    _proc.kill()
+                except Exception:
+                    pass
 
     async def kill(self) -> None:
         """Kill the currently running subprocess if any. No-op if idle."""

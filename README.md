@@ -147,6 +147,24 @@ At least one agent must be configured and online. See [`docs/agents.md`](docs/ag
 
 ---
 
+## Data & Privacy
+
+| Agent | Where inference runs | Data leaves your machine? |
+|---|---|---|
+| `claude` | Anthropic API (cloud) | Yes — prompts sent to Anthropic |
+| `codex` | OpenAI API (cloud) | Yes — prompts sent to OpenAI |
+| `local-agent` | Your machine (LM Studio, Ollama, etc.) | No |
+| `openclaw` / `researcher` | Your machine (via OpenClaw/Dream Server) | No |
+
+**What stays local regardless of which agents you use:**
+- Conversation history (SQLite database on your machine)
+- The wiki (`wiki/pages/`, `wiki/private/`)
+- All config, secrets, and bot state
+
+For a fully private setup with no cloud inference, use only the `local-agent` with a self-hosted model. [Dream Server](https://github.com/Light-Heart-Labs/DreamServer) is a good companion for this.
+
+---
+
 ## Security Notes
 
 - Bot token and API keys are read from `.env` — never commit this file

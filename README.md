@@ -185,6 +185,35 @@ If you find this useful, donations are appreciated:
 
 ---
 
+## Memory Washing Machine
+
+`washer.py` is an optional nightly pipeline that harvests durable memories from your conversation history using a local LLM (LM Studio / Ollama).
+
+It reads from `conversations` and `conversations_archive`, calls the local model for extraction, and routes results to three tiers:
+
+- **Shared memories** (`fact` type) — injected into all agent prompts
+- **Shared promotions** (`preference` / `context`) — queued for review before injection
+- **Private review queue** — `is_private` items go here; reviewed and approved via CLI
+
+**Setup:**
+```
+# .env
+TARGET_USER_ID=your_discord_user_id
+USER_DISPLAY_NAME=YourName
+E4B_BASE_URL=http://localhost:1234/v1
+E4B_MODEL=gemma-3-4b-it
+
+# Schedule (Windows)
+python scripts/setup-scheduler.ps1
+
+# Schedule (Linux/macOS — add to crontab)
+# 0 2 * * * cd /path/to/discord-nexus && python washer.py
+```
+
+The memory washing machine concept is from **Mark Kashef** — ["I Tried OpenClaw and Hermes. I Kept Claude Code."](https://youtu.be/rVzGu5OYYS0) (timestamp 10:57).
+
+---
+
 ## Acknowledgements
 
 The optional `OpenClawRelayAgent` is designed to work with [OpenClaw](https://github.com/Light-Heart-Labs/DreamServer), the agent framework included in **Dream Server** by [Light Heart Labs](https://github.com/Light-Heart-Labs). Dream Server is a fully local AI stack (LLM inference, agents, voice, workflows, RAG) deployable on your own hardware with a single command — and a natural companion to discord-nexus if you want a complete self-hosted setup.

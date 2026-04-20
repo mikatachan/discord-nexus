@@ -635,6 +635,133 @@ class Database:
         )
         await self._db.commit()
 
+    # --- Memory watermark ---
+
+    async def get_watermark(self, source: str) -> int:
+        cursor = await self._db.execute(
+            "SELECT last_row_id FROM memory_watermark WHERE source = ?", (source,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+    async def set_watermark(self, source: str, row_id: int) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO memory_watermark (source, last_row_id, last_updated)
+            VALUES (?, ?, ?)
+            ON CONFLICT(source) DO UPDATE SET
+                last_row_id = excluded.last_row_id,
+                last_updated = excluded.last_updated
+            """,
+            (source, row_id, time.time()),
+        )
+        await self._db.commit()
+
+    # --- Memory promotions (shared DB) ---
+
+    async def save_promotion(
+        self,
+        content_hash: str,
+        content: str,
+        type: str,
+        *,
+        importance: int = 3,
+        route_reason: str | None = None,
+        source_thread_id: str | None = None,
+        source_message_id: str | None = None,
+    ) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO memory_promotions
+                (content_hash, content, type, importance, route_reason,
+                 source_thread_id, source_message_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(content_hash) DO NOTHING
+            """,
+            (content_hash, content, type, importance, route_reason,
+             source_thread_id, source_message_id, time.time()),
+        )
+        await self._db.commit()
+
+    # --- Review queue (private DB) ---
+
+    async def save_review_queue(
+        self,
+        content_hash: str,
+        content: str,
+        type: str,
+        *,
+        importance: int = 3,
+        route_reason: str | None = None,
+        source_thread_id: str | None = None,
+        source_message_id: str | None = None,
+    ) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO review_queue
+                (content_hash, content, type, importance, route_reason,
+                 source_thread_id, source_message_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(content_hash) DO NOTHING
+            """,
+            (content_hash, content, type, importance, route_reason,
+             source_thread_id, source_message_id, time.time()),
+        )
+        await self._db.commit()
+
+    async def get_review_queue(
+        self, status: str = "pending", limit: int = 50
+    ) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM review_queue WHERE status = ? ORDER BY created_at ASC LIMIT ?",
+            (status, limit),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_review_queue_item(
+        self, content_hash: str, status: str = "pending"
+    ) -> dict | None:
+        cursor = await self._db.execute(
+            "SELECT * FROM review_queue WHERE content_hash = ? AND status = ?",
+            (content_hash, status),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def update_review_status(self, content_hash: str, status: str) -> None:
+        await self._db.execute(
+            "UPDATE review_queue SET status = ?, reviewed_at = ? WHERE content_hash = ?",
+            (status, time.time(), content_hash),
+        )
+        await self._db.commit()
+
+    async def log_memory_audit(
+        self,
+        action: str,
+        memory_hash: str,
+        db_source: str,
+        caller_type: str = "system",
+        caller_id: str = "washer",
+    ) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO memory_audit (action, memory_hash, db_source, caller_type, caller_id, ts)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (action, memory_hash, db_source, caller_type, caller_id, time.time()),
+        )
+        await self._db.commit()
+
+    async def private_hash_exists(self, content_hash: str) -> bool:
+        cursor = await self._db.execute(
+            """
+            SELECT 1 FROM memories_private WHERE content_hash = ?
+            UNION SELECT 1 FROM review_queue WHERE content_hash = ?
+            """,
+            (content_hash, content_hash),
+        )
+        return await cursor.fetchone() is not None
+
     # --- Sessions ---
 
     async def save_session(

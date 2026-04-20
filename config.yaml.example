@@ -320,3 +320,17 @@ wiki:
   # Pinned pages are always prepended to agent context regardless of query.
   # These pages must exist at wiki/pages/<name>.md before the bot starts.
   # pinned_pages: []
+
+# ── Memory washer ─────────────────────────────────────────────────────────────
+# washer.py extracts memories from conversation history via a local LLM.
+# Configure via .env — these keys are NOT in config.yaml (they may contain IDs).
+#
+# Required .env vars:
+#   TARGET_USER_ID      Discord user ID whose messages to harvest
+#   USER_DISPLAY_NAME   Name used in the extraction prompt (e.g. "Alex")
+#   E4B_BASE_URL        LM Studio base URL (default: http://localhost:1234/v1)
+#   E4B_MODEL           Model ID to use (e.g. "gemma-3-4b-it")
+#
+# Schedule: run washer.py daily (e.g. 2am).
+# Windows: python scripts/setup-scheduler.ps1
+# Linux/macOS: add to crontab — 0 2 * * * cd /path/to/discord-nexus && python washer.py

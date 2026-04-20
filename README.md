@@ -229,7 +229,7 @@ If you find this useful, donations are appreciated:
 
 ## Acknowledgements
 
-The optional `OpenClawRelayAgent` is designed to work with [OpenClaw](https://github.com/Light-Heart-Labs/DreamServer), the agent framework included in **Dream Server** by [Light Heart Labs](https://github.com/Light-Heart-Labs). Dream Server is a fully local AI stack (LLM inference, agents, voice, workflows, RAG) deployable on your own hardware with a single command — and a natural companion to discord-nexus if you want a complete self-hosted setup.
+The optional `OpenClawRelayAgent` is designed to work with [Dream Server](https://github.com/Light-Heart-Labs/DreamServer) by Light Heart Labs — a fully local AI stack (LLM inference, agents, voice, workflows, RAG) deployable on your own hardware with a single command. It's a natural companion to discord-nexus if you want a complete self-hosted setup.
 
 ---
 

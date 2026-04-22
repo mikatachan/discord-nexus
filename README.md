@@ -121,10 +121,16 @@ In the Discord Developer Portal, enable the **Message Content Intent** and gener
 |---|---|
 | Multi-agent routing | Role mentions and slash commands route to the correct agent |
 | @team broadcast | Mention a configurable team role to call all agents in parallel |
-| Agent handoffs | Agents hand off tasks to each other via `@AgentName <task>` |
-| Per-thread history | Conversation history stored per thread per agent in SQLite |
+| **THEN barriers** | Sequential multi-agent execution: `@claude do X THEN @codex do Y` — stages run in order, agents within a stage run in parallel |
+| **Per-agent prompt splitting** | Multi-agent messages give each agent only its own section |
+| **List-reference expansion** | `do (1)`, `#2`, `step 3` auto-expand to numbered items from the last assistant message |
+| Agent handoffs | Agents hand off tasks to each other via `@AgentName <task>` in responses |
+| **Session persistence** | Claude and Codex sessions persist per thread — subsequent messages resume the same CLI session |
+| **Claude shell access** | Claude has full tool access (Bash, Edit, Read) — can run commands, commit code, edit files |
+| Per-thread history | Conversation history stored per thread in SQLite |
 | Agent workspaces | Per-thread scratch state preserved across turns |
 | Live streaming | Claude and Codex stream partial output to a Discord placeholder as they generate |
+| **Activity timeout override** | Per-command `-t <seconds>` flag for long-running Codex tasks (e.g. `!g -t 1800 ./gradlew test`) |
 | Thread support | Agents work correctly in forum posts and thread channels via webhook routing |
 | /stop | Cancel a running agent mid-generation with a slash command |
 | Cron jobs | `/cron add` schedules recurring agent prompts on a cron expression |
@@ -134,6 +140,7 @@ In the Discord Developer Portal, enable the **Message Content Intent** and gener
 | Private review queue | Sensitive extractions held for manual approval before injection |
 | Discoveries | Agents post notable findings to a shared channel |
 | Web research | Optional researcher agent triggers search queries |
+| Attachment processing | Text extraction and vision blocks for file attachments across all routing paths |
 | Secret redaction | Output is scanned for secrets before posting |
 | Health dashboard | `/dashboard` posts a live-updating embed with agent status |
 | Rate-limit fallback | If Claude is rate-limited, falls back to Codex, then local LLM |

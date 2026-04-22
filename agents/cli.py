@@ -103,7 +103,9 @@ def _extract_codex_text(event: dict) -> str:
 
 
 class ClaudeAgent(BaseAgent):
-    """Claude Code CLI agent via `claude -p`."""
+    """Claude Code CLI agent via `claude -p` with session persistence and full tool access."""
+
+    _ACTIVITY_TIMEOUT = 90
 
     def __init__(self, timeout: int = 120, work_dir: str | None = None, model: str | None = None):
         super().__init__(name="Claude", timeout=timeout)
@@ -122,23 +124,52 @@ class ClaudeAgent(BaseAgent):
             except Exception:
                 pass
 
-    # Seconds of no stdout activity before we consider the process hung.
-    _ACTIVITY_TIMEOUT = 90
-
     async def call(self, messages: list[dict], system_prompt: str,
                    mission: str = "", workspace: str = "",
                    work_dir: str | None = None,
                    timeout: int | None = None,
                    on_chunk=None) -> tuple[str, dict]:
-        """Call Claude CLI. on_chunk(text) is called with accumulated text as partial messages arrive."""
+        """Fresh Claude CLI call. Returns (response_text, metadata) with session_id in metadata."""
         prompt = self._build_prompt(messages, system_prompt, mission=mission, workspace=workspace)
         effective_dir = work_dir or self.work_dir
-        effective_timeout = timeout or self.timeout
 
+        cmd = [
+            "claude", "-p", "--verbose", "--output-format", "stream-json",
+            "--include-partial-messages", "--dangerously-skip-permissions",
+        ]
+        if self.model:
+            cmd += ["--model", self.model]
+
+        return await self._run_claude_command(
+            cmd, prompt, effective_dir=effective_dir,
+            effective_timeout=timeout or self.timeout, on_chunk=on_chunk,
+        )
+
+    async def resume(self, session_id: str, prompt: str,
+                     work_dir: str | None = None,
+                     timeout: int | None = None,
+                     on_chunk=None) -> tuple[str, dict]:
+        """Resume an existing Claude CLI session."""
+        effective_dir = work_dir or self.work_dir
+
+        cmd = [
+            "claude", "-p", "--verbose", "--output-format", "stream-json",
+            "--include-partial-messages", "--dangerously-skip-permissions",
+            "--resume", session_id,
+        ]
+        if self.model:
+            cmd += ["--model", self.model]
+
+        return await self._run_claude_command(
+            cmd, prompt, effective_dir=effective_dir,
+            effective_timeout=timeout or self.timeout, on_chunk=on_chunk,
+        )
+
+    async def _run_claude_command(self, cmd: list[str], prompt: str, *,
+                                  effective_dir: str | None,
+                                  effective_timeout: int,
+                                  on_chunk=None) -> tuple[str, dict]:
         try:
-            cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages"]
-            if self.model:
-                cmd += ["--model", self.model]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
@@ -150,20 +181,17 @@ class ClaudeAgent(BaseAgent):
             )
             self._current_proc = proc
 
-            # Write prompt to stdin then close — Claude reads it all before responding.
             proc.stdin.write(prompt.encode())
             await proc.stdin.drain()
             proc.stdin.close()
 
-            # Read stream-json events line by line.
-            # Kill if no event arrives for _ACTIVITY_TIMEOUT seconds (hung detection)
-            # OR if total wall-clock exceeds effective_timeout.
             loop = asyncio.get_event_loop()
             deadline = loop.time() + effective_timeout
             last_activity = loop.time()
 
             response_text = ""
             metadata: dict = {}
+            session_id: str | None = None
 
             while True:
                 now = loop.time()
@@ -171,12 +199,10 @@ class ClaudeAgent(BaseAgent):
                     raise AgentTimeoutError(
                         f"Claude exceeded total timeout of {effective_timeout}s"
                     )
-                # Wait at most _ACTIVITY_TIMEOUT or remaining wall-clock, whichever is shorter.
                 read_timeout = min(self._ACTIVITY_TIMEOUT, deadline - now)
                 try:
                     raw = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
                 except asyncio.TimeoutError:
-                    # Check whether this is an activity timeout or wall-clock timeout.
                     if loop.time() - last_activity >= self._ACTIVITY_TIMEOUT:
                         raise AgentTimeoutError(
                             f"Claude stopped responding (no activity for {self._ACTIVITY_TIMEOUT}s)"
@@ -184,7 +210,7 @@ class ClaudeAgent(BaseAgent):
                     continue
 
                 if not raw:
-                    break  # EOF — process finished
+                    break
 
                 last_activity = loop.time()
                 line = raw.decode("utf-8", errors="replace").strip()
@@ -198,8 +224,12 @@ class ClaudeAgent(BaseAgent):
 
                 event_type = event.get("type")
 
+                # Capture session_id from any event that carries it
+                evt_session = event.get("session_id")
+                if isinstance(evt_session, str) and evt_session:
+                    session_id = evt_session
+
                 if event_type == "assistant":
-                    # Partial message — stream accumulated text to Discord placeholder.
                     if on_chunk is not None:
                         content_blocks = event.get("message", {}).get("content", [])
                         for block in content_blocks:
@@ -222,6 +252,7 @@ class ClaudeAgent(BaseAgent):
                         "tokens_output": usage.get("output_tokens"),
                         "tokens_cache_read": usage.get("cache_read_input_tokens"),
                         "cost_usd": event.get("total_cost_usd"),
+                        "session_id": session_id,
                     }
 
             await proc.wait()
@@ -234,9 +265,10 @@ class ClaudeAgent(BaseAgent):
                 raise AgentOfflineError(f"Claude CLI failed (code {proc.returncode}): {err[:200]}")
 
             log.info(
-                "Claude — chars: %d, cost: $%.4f, exit: %d",
+                "Claude — chars: %d, cost: $%.4f, session: %s, exit: %d",
                 len(response_text),
                 metadata.get("cost_usd") or 0,
+                session_id or "none",
                 proc.returncode,
             )
             return response_text, metadata
@@ -316,7 +348,6 @@ class CodexAgent(BaseAgent):
                 _CODEX_CMD, "exec",
                 "--skip-git-repo-check",
                 "--sandbox", "danger-full-access",
-                "--ephemeral",
                 "--json",  # JSONL event stream — enables streaming + token metadata
                 "-",
             ]
@@ -324,107 +355,48 @@ class CodexAgent(BaseAgent):
                 cmd_args.insert(2, "-C")
                 cmd_args.insert(3, effective_dir)
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd_args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=effective_dir,
-                env=_filtered_env(),
-                **_NO_WINDOW,
+            return await self._run_codex_command(
+                cmd_args,
+                prompt,
+                effective_dir=effective_dir,
+                effective_timeout=effective_timeout,
+                activity_timeout=activity_timeout,
+                on_chunk=on_chunk,
             )
-            self._current_proc = proc
 
-            # Write prompt to stdin then close.
-            proc.stdin.write(prompt.encode())
-            await proc.stdin.drain()
-            proc.stdin.close()
-
-            # Read JSONL events line by line.
-            # With --json, Codex emits events during tool calls, but goes silent during model API
-            # response synthesis (or during long-running shell commands like gradle). Configurable
-            # via activity_timeout on the agent instance, or per-invocation override (e.g. -t flag).
-            _ACTIVITY_TIMEOUT = activity_timeout or self.activity_timeout
-            loop = asyncio.get_event_loop()
-            deadline = loop.time() + effective_timeout
-            last_activity = loop.time()
-
-            response_text = ""
-            last_chunk_sent = ""  # track last text sent to on_chunk to avoid re-sending
-            tokens_used = 0
-            tokens_input = 0
-            tokens_cache_read = 0
-            metadata: dict = {}
-
-            while True:
-                now = loop.time()
-                if now >= deadline:
-                    raise AgentTimeoutError(f"Codex exceeded total timeout of {effective_timeout}s")
-                read_timeout = min(_ACTIVITY_TIMEOUT, deadline - now)
+        except FileNotFoundError:
+            raise AgentOfflineError("Codex CLI not found. Is it installed?")
+        finally:
+            _proc = self._current_proc
+            self._current_proc = None
+            if _proc is not None and _proc.returncode is None:
                 try:
-                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
-                except asyncio.TimeoutError:
-                    if loop.time() - last_activity >= _ACTIVITY_TIMEOUT:
-                        raise AgentTimeoutError(
-                            f"Codex stopped responding (no activity for {_ACTIVITY_TIMEOUT}s)"
-                        )
-                    continue
-                if not raw:
-                    break
-                last_activity = loop.time()
+                    _proc.kill()
+                except Exception:
+                    pass
 
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
+    async def resume(self, session_id: str, prompt: str,
+                     work_dir: str | None = None,
+                     timeout: int | None = None,
+                     activity_timeout: int | None = None,
+                     on_chunk=None) -> tuple[str, dict]:
+        effective_dir = work_dir or self.work_dir
+        effective_timeout = timeout or self.timeout
 
-                try:
-                    event = _json.loads(line)
-                except _json.JSONDecodeError:
-                    # Non-JSON line — log and skip (shouldn't happen in --json mode)
-                    log.debug("Codex non-JSON line: %s", line[:120])
-                    continue
+        try:
+            cmd_args = [_CODEX_CMD, "resume", session_id, "--json", "-"]
+            if effective_dir:
+                cmd_args.insert(2, "-C")
+                cmd_args.insert(3, effective_dir)
 
-                event_type = event.get("type", "")
-                log.debug("Codex event: %s", event_type)
-
-                # Extract text from known event shapes.
-                partial_text = _extract_codex_text(event)
-                if not partial_text and event_type and event_type not in _CODEX_NON_TEXT_EVENTS:
-                    # Truly unknown shape — log full event at DEBUG so we can add support for it.
-                    log.debug("Codex unmatched event (%s): %s", event_type, str(event)[:300])
-                if partial_text and partial_text != last_chunk_sent:
-                    response_text = partial_text  # Codex events carry accumulated text
-                    last_chunk_sent = partial_text
-                    if on_chunk is not None:
-                        await on_chunk(partial_text)
-
-                # Token counts from turn.completed: input_tokens, cached_input_tokens, output_tokens
-                usage = event.get("usage") or event.get("response", {}).get("usage", {})
-                if usage:
-                    tokens_used = usage.get("output_tokens") or usage.get("completion_tokens") or tokens_used
-                    tokens_input = usage.get("input_tokens") or tokens_input
-                    tokens_cache_read = usage.get("cached_input_tokens") or tokens_cache_read
-
-            await proc.wait()
-            err_data = await proc.stderr.read()
-            err_output = err_data.decode("utf-8", errors="replace").replace("\r\n", "\n")
-
-            if proc.returncode != 0:
-                log.error("Codex CLI non-zero exit (code %d): %s", proc.returncode, err_output[:200])
-                if not response_text:
-                    if _is_rate_limit(err_output):
-                        raise AgentRateLimitError(f"Codex usage/rate limit: {err_output[:200]}")
-                    raise AgentOfflineError(f"Codex CLI failed: {err_output[:200]}")
-                # Partial output present — return it but the error is already logged above.
-
-            metadata = {
-                "tokens_output": tokens_used or None,
-                "tokens_input": tokens_input or None,
-                "tokens_cache_read": tokens_cache_read or None,
-            }
-            log.info("Codex — chars: %d, tokens: %d, exit: %d", len(response_text), tokens_used, proc.returncode)
-            return response_text, metadata
-
+            return await self._run_codex_command(
+                cmd_args,
+                prompt,
+                effective_dir=effective_dir,
+                effective_timeout=effective_timeout,
+                activity_timeout=activity_timeout,
+                on_chunk=on_chunk,
+            )
         except FileNotFoundError:
             raise AgentOfflineError("Codex CLI not found. Is it installed?")
         finally:
@@ -446,6 +418,116 @@ class CodexAgent(BaseAgent):
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except Exception:
                 pass
+
+    async def _run_codex_command(self, cmd_args: list[str], prompt: str, *,
+                                 effective_dir: str | None,
+                                 effective_timeout: int,
+                                 activity_timeout: int | None = None,
+                                 on_chunk=None) -> tuple[str, dict]:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=effective_dir,
+            env=_filtered_env(),
+            limit=10 * 1024 * 1024,  # 10 MB — prevents ValueError on long Codex lines
+            **_NO_WINDOW,
+        )
+        self._current_proc = proc
+
+        # Write prompt to stdin then close.
+        proc.stdin.write(prompt.encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+
+        # With --json, Codex emits events during tool calls, but can go silent during response
+        # synthesis (or during long-running shell commands like gradle). Configurable via
+        # activity_timeout on the agent instance, or per-invocation override (e.g. -t flag).
+        _ACTIVITY_TIMEOUT = activity_timeout or self.activity_timeout
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + effective_timeout
+        last_activity = loop.time()
+
+        response_text = ""
+        last_chunk_sent = ""  # track last text sent to on_chunk to avoid re-sending
+        tokens_used = 0
+        tokens_input = 0
+        tokens_cache_read = 0
+        codex_session_id: str | None = None
+
+        while True:
+            now = loop.time()
+            if now >= deadline:
+                raise AgentTimeoutError(f"Codex exceeded total timeout of {effective_timeout}s")
+            read_timeout = min(_ACTIVITY_TIMEOUT, deadline - now)
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
+            except asyncio.TimeoutError:
+                if loop.time() - last_activity >= _ACTIVITY_TIMEOUT:
+                    raise AgentTimeoutError(
+                        f"Codex stopped responding (no activity for {_ACTIVITY_TIMEOUT}s)"
+                    )
+                continue
+            if not raw:
+                break
+            last_activity = loop.time()
+
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+
+            try:
+                event = _json.loads(line)
+            except _json.JSONDecodeError:
+                # Non-JSON line — log and skip (shouldn't happen in --json mode)
+                log.debug("Codex non-JSON line: %s", line[:120])
+                continue
+
+            event_type = event.get("type", "")
+            log.debug("Codex event: %s", event_type)
+
+            if event_type == "session_meta":
+                codex_session_id = event.get("payload", {}).get("id")
+
+            # Extract text from known event shapes.
+            partial_text = _extract_codex_text(event)
+            if not partial_text and event_type and event_type not in _CODEX_NON_TEXT_EVENTS:
+                # Truly unknown shape — log full event at DEBUG so we can add support for it.
+                log.debug("Codex unmatched event (%s): %s", event_type, str(event)[:300])
+            if partial_text and partial_text != last_chunk_sent:
+                response_text = partial_text  # Codex events carry accumulated text
+                last_chunk_sent = partial_text
+                if on_chunk is not None:
+                    await on_chunk(partial_text)
+
+            # Token counts from turn.completed: input_tokens, cached_input_tokens, output_tokens
+            usage = event.get("usage") or event.get("response", {}).get("usage", {})
+            if usage:
+                tokens_used = usage.get("output_tokens") or usage.get("completion_tokens") or tokens_used
+                tokens_input = usage.get("input_tokens") or tokens_input
+                tokens_cache_read = usage.get("cached_input_tokens") or tokens_cache_read
+
+        await proc.wait()
+        err_data = await proc.stderr.read()
+        err_output = err_data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+        if proc.returncode != 0:
+            log.error("Codex CLI non-zero exit (code %d): %s", proc.returncode, err_output[:200])
+            if not response_text:
+                if _is_rate_limit(err_output):
+                    raise AgentRateLimitError(f"Codex usage/rate limit: {err_output[:200]}")
+                raise AgentOfflineError(f"Codex CLI failed: {err_output[:200]}")
+            # Partial output present — return it but the error is already logged above.
+
+        metadata = {
+            "tokens_output": tokens_used or None,
+            "tokens_input": tokens_input or None,
+            "tokens_cache_read": tokens_cache_read or None,
+            "codex_session_id": codex_session_id,
+        }
+        log.info("Codex — chars: %d, tokens: %d, exit: %d", len(response_text), tokens_used, proc.returncode)
+        return response_text, metadata
 
     async def health_check(self) -> dict:
         try:

@@ -76,6 +76,74 @@ def parse_commands(content: str) -> tuple[list[str], str | None]:
     return (agents, prompt if prompt else None)
 
 
+# Barrier keywords — a line matching any of these separates sequential stages.
+# All synonyms collapse to the same meaning: "wait for the previous stage to finish."
+_BARRIER_RE = re.compile(
+    r"^\s*(?:THEN|AFTER|NEXT|BEFORE|SEQUENTIAL|WAIT|AFTERWARDS|AFTER\s+THAT|WHEN\s+DONE|ONCE\s+DONE)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def split_stages(content: str) -> list[str]:
+    """Split a message into sequential stages on barrier keywords.
+
+    Returns a list of text chunks. Adjacent chunks run sequentially;
+    agents within a single chunk run in parallel.
+    If no barrier keywords are found, returns a single-element list.
+    """
+    parts = _BARRIER_RE.split(content)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _parse_chunk(chunk: str) -> list[tuple[str, str]]:
+    """Parse a single chunk (no barrier keywords) into (agent, prompt) pairs."""
+    # !all / !a — broadcast, no splitting
+    if re.search(r"!(?:all|a)\b", chunk, re.IGNORECASE):
+        prompt = _ALL_BANGS.sub("", chunk).strip()
+        if prompt:
+            return [("__all__", prompt)]
+        return []
+
+    hits: list[tuple[int, str, re.Match]] = []
+    for agent_name, alias_pattern in BANG_ALIASES.items():
+        for m in re.finditer(alias_pattern + r"\b", chunk, re.IGNORECASE):
+            hits.append((m.start(), agent_name, m))
+
+    if not hits:
+        return []
+
+    hits.sort(key=lambda h: h[0])
+
+    sections: list[tuple[str, str]] = []
+    for i, (pos, agent_name, match) in enumerate(hits):
+        text_start = match.end()
+        text_end = hits[i + 1][0] if i + 1 < len(hits) else len(chunk)
+        prompt = chunk[text_start:text_end].strip()
+        if prompt:
+            sections.append((agent_name, prompt))
+
+    return sections
+
+
+def parse_sectioned_commands(content: str) -> list[list[tuple[str, str]]]:
+    """Parse a message into sequential stages of per-agent (agent_name, prompt) pairs.
+
+    Barrier keywords (THEN, AFTER, NEXT, etc.) separate stages that run sequentially.
+    Agents within a single stage run in parallel.
+
+    Returns:
+        List of stages, where each stage is a list of (agent_name, prompt) pairs.
+        Empty list if no commands found.
+    """
+    stages = split_stages(content)
+    result: list[list[tuple[str, str]]] = []
+    for chunk in stages:
+        sections = _parse_chunk(chunk)
+        if sections:
+            result.append(sections)
+    return result
+
+
 def resolve_channel_id(channel) -> int:
     """Resolve thread→parent channel ID for config lookup.
 

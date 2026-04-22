@@ -26,7 +26,7 @@ import discord
 from discord.ext import commands
 
 from agents.base import AgentOfflineError, AgentRateLimitError, AgentTimeoutError
-from routing.dispatcher import ALL_AGENTS, parse_commands, resolve_channel_id, should_respond
+from routing.dispatcher import ALL_AGENTS, parse_commands, parse_sectioned_commands, split_stages, resolve_channel_id, should_respond
 from security.filter import scan_output
 from utils.attachments import ProcessedAttachments, process_attachments
 from utils.chunker import chunk_message
@@ -79,6 +79,58 @@ class Agents(commands.Cog):
         # channel_id (str) → agent currently running in that channel
         self._active_agents: dict[str, object] = {}
 
+    # --- workspace / session helpers ---
+
+    # Keys used to store CLI session IDs in workspace JSON, keyed by agent name.
+    _SESSION_KEY = {
+        "codex": "codex_session_id",
+        "claude": "session_id",
+    }
+
+    def _parse_workspace(self, workspace: str, agent_name: str) -> tuple[str | None, dict | None]:
+        """Return stored session id plus parsed workspace dict when possible."""
+        if not workspace:
+            return None, None
+        try:
+            data = json.loads(workspace)
+        except (TypeError, json.JSONDecodeError):
+            return None, None
+        if not isinstance(data, dict):
+            return None, None
+        key = self._SESSION_KEY.get(agent_name)
+        session_id = data.get(key) if key else None
+        if not isinstance(session_id, str) or not session_id.strip():
+            session_id = None
+        return session_id, data
+
+    def _workspace_without_session(self, workspace: str, agent_name: str) -> str:
+        """Strip internal session state before injecting workspace into prompts."""
+        _, data = self._parse_workspace(workspace, agent_name)
+        if data is None:
+            return workspace
+        key = self._SESSION_KEY.get(agent_name)
+        prompt_data = {k: v for k, v in data.items() if k != key}
+        return json.dumps(prompt_data) if prompt_data else ""
+
+    def _workspace_with_session(self, workspace: str, agent_name: str, session_id: str) -> str:
+        """Merge a session id into the workspace JSON object."""
+        _, data = self._parse_workspace(workspace, agent_name)
+        merged = dict(data) if data is not None else {}
+        key = self._SESSION_KEY.get(agent_name)
+        if key:
+            merged[key] = session_id
+        return json.dumps(merged)
+
+    # Legacy aliases — scratch processing still calls these for Codex
+    def _parse_codex_workspace(self, workspace: str) -> tuple[str | None, dict | None]:
+        return self._parse_workspace(workspace, "codex")
+
+    def _workspace_without_codex_session(self, workspace: str) -> str:
+        return self._workspace_without_session(workspace, "codex")
+
+    def _workspace_with_codex_session(self, workspace: str, session_id: str) -> str:
+        return self._workspace_with_session(workspace, "codex", session_id)
+
     async def dispatch_agents(self, message: discord.Message) -> bool:
         """Handle agent @role mentions and !bang prefix dispatch.
 
@@ -127,91 +179,150 @@ class Agents(commands.Cog):
         # --- @role mention routing ---
         agent_role_ids = getattr(self.bot, "_agent_role_ids", {})
         if agent_role_ids and message.role_mentions:
-            role_agents: list[str] = []
+            # Build mention_string -> agent_name map for matched roles
+            mention_to_agent: dict[str, str] = {}
             for agent_name, role_id in agent_role_ids.items():
                 for role_mention in message.role_mentions:
                     if role_mention.id == role_id:
-                        role_agents.append(agent_name)
+                        mention_to_agent[role_mention.mention] = agent_name
                         break
-            if role_agents:
-                # Strip all role mentions from content to get the prompt
+            if mention_to_agent:
                 content = message.content
-                for mention in message.role_mentions:
-                    content = content.replace(mention.mention, "")
-                prompt = content.strip()
-                if _attachments and _attachments.text_block:
-                    prompt = (prompt + "\n\n" + _attachments.text_block).strip()
-                if not prompt:
-                    names = " / ".join(f"@{a.capitalize()}" for a in role_agents)
+
+                def _parse_role_chunk(chunk: str) -> list[tuple[str, str]]:
+                    """Parse a single chunk for role-mention sections."""
+                    hits: list[tuple[int, int, str]] = []
+                    for mention_str, agent_name in mention_to_agent.items():
+                        idx = chunk.find(mention_str)
+                        if idx >= 0:
+                            hits.append((idx, idx + len(mention_str), agent_name))
+                    if not hits:
+                        return []
+                    hits.sort(key=lambda h: h[0])
+                    sections: list[tuple[str, str]] = []
+                    for i, (start, end, agent_name) in enumerate(hits):
+                        text_end = hits[i + 1][0] if i + 1 < len(hits) else len(chunk)
+                        section_text = chunk[end:text_end].strip()
+                        if section_text:
+                            sections.append((agent_name, section_text))
+                    return sections
+
+                # Split on barrier keywords (THEN, AFTER, etc.), then parse each chunk.
+                raw_stages = split_stages(content)
+                role_stages: list[list[tuple[str, str]]] = []
+                for chunk in raw_stages:
+                    sections = _parse_role_chunk(chunk)
+                    if sections:
+                        role_stages.append(sections)
+
+                if not role_stages:
+                    names = " / ".join(f"@{a.capitalize()}" for a in mention_to_agent.values())
                     await message.channel.send(f"Usage: @{names} <your question>")
                     return True
+
                 channel_id = resolve_channel_id(message.channel)
-                active_agents = [
-                    a for a in role_agents
-                    if should_respond(channel_id, self.bot.agent_channels.get(a, set()))
-                ]
-                inactive = [a for a in role_agents if a not in active_agents]
-                if inactive:
-                    names = ", ".join(a.capitalize() for a in inactive)
-                    await message.channel.send(f"{names} isn't active in this channel.")
-                if active_agents:
-                    thread_id = str(message.channel.id)
-                    await asyncio.gather(*[
-                        self.handle_agent_request(
-                            agent_name=agent_name,
-                            prompt=prompt,
-                            thread_id=thread_id,
-                            channel=message.channel,
-                            user_id=message.author.id,
-                            attachments=_attachments,
-                        )
-                        for agent_name in active_agents
-                    ])
+                thread_id = str(message.channel.id)
+
+                # Save full user message once.
+                all_prompts = [p for stage in role_stages for _, p in stage]
+                await self.bot.db.save_message(
+                    thread_id, "user", "\n\n".join(all_prompts),
+                    author_id=str(message.author.id),
+                    message_id=str(message.id),
+                )
+
+                # Run stages sequentially; agents within a stage in parallel.
+                for stage in role_stages:
+                    if _attachments and _attachments.text_block:
+                        stage = [
+                            (a, (p + "\n\n" + _attachments.text_block).strip())
+                            for a, p in stage
+                        ]
+                    dispatch_list: list[tuple[str, str]] = []
+                    inactive: list[str] = []
+                    for agent_name, prompt in stage:
+                        if should_respond(channel_id, self.bot.agent_channels.get(agent_name, set())):
+                            dispatch_list.append((agent_name, prompt))
+                        else:
+                            inactive.append(agent_name)
+                    if inactive:
+                        names = ", ".join(a.capitalize() for a in inactive)
+                        await message.channel.send(f"{names} isn't active in this channel.")
+                    if dispatch_list:
+                        await asyncio.gather(*[
+                            self.handle_agent_request(
+                                agent_name=agent_name,
+                                prompt=agent_prompt,
+                                thread_id=thread_id,
+                                channel=message.channel,
+                                user_id=message.author.id,
+                                origin_already_persisted=True,
+                                attachments=_attachments,
+                            )
+                            for agent_name, agent_prompt in dispatch_list
+                        ])
                 return True
 
-        # --- !bang command routing ---
-        agents, prompt = parse_commands(message.content)
-        if not agents:
+        # --- bang command routing ---
+        stages = parse_sectioned_commands(message.content)
+        if not stages:
             return False
 
-        if _attachments and _attachments.text_block:
-            prompt = (prompt + "\n\n" + _attachments.text_block).strip() if prompt else _attachments.text_block
-
-        if not prompt:
-            names = ", ".join(f"`!{a}`" for a in agents)
-            await message.channel.send(f"Usage: {names} <your question>")
-            return True
-
         channel_id = resolve_channel_id(message.channel)
-        active_agents = []
-        inactive_agents = []
-        for agent_name in agents:
-            agent_chs = self.bot.agent_channels.get(agent_name, set())
-            if should_respond(channel_id, agent_chs):
-                active_agents.append(agent_name)
-            else:
-                inactive_agents.append(agent_name)
-
-        if inactive_agents:
-            names = ", ".join(a.capitalize() for a in inactive_agents)
-            await message.channel.send(f"{names} isn't active in this channel.")
-
-        if not active_agents:
-            return True
-
         thread_id = str(message.channel.id)
-        tasks = [
-            self.handle_agent_request(
-                agent_name=agent_name,
-                prompt=prompt,
-                thread_id=thread_id,
-                channel=message.channel,
-                user_id=message.author.id,
-                attachments=_attachments,
-            )
-            for agent_name in active_agents
-        ]
-        await asyncio.gather(*tasks)
+
+        # Save the full user message once before any dispatch.
+        all_prompts = [p for stage in stages for _, p in stage]
+        await self.bot.db.save_message(
+            thread_id, "user", "\n\n".join(all_prompts),
+            author_id=str(message.author.id),
+            message_id=str(message.id),
+        )
+
+        # Run stages sequentially; agents within a stage run in parallel.
+        for stage in stages:
+            # Expand __all__ into broadcast list
+            if stage[0][0] == "__all__":
+                broadcast_prompt = stage[0][1]
+                if _attachments and _attachments.text_block:
+                    broadcast_prompt = (broadcast_prompt + "\n\n" + _attachments.text_block).strip()
+                stage = [(a, broadcast_prompt) for a in ALL_AGENTS]
+
+            # Append attachment text to each section's prompt
+            if _attachments and _attachments.text_block:
+                stage = [
+                    (a, (p + "\n\n" + _attachments.text_block).strip())
+                    for a, p in stage
+                ]
+
+            dispatch_list: list[tuple[str, str]] = []
+            inactive_agents = []
+            for agent_name, prompt in stage:
+                agent_chs = self.bot.agent_channels.get(agent_name, set())
+                if should_respond(channel_id, agent_chs):
+                    dispatch_list.append((agent_name, prompt))
+                else:
+                    inactive_agents.append(agent_name)
+
+            if inactive_agents:
+                names = ", ".join(a.capitalize() for a in inactive_agents)
+                await message.channel.send(f"{names} isn't active in this channel.")
+
+            if not dispatch_list:
+                continue
+
+            await asyncio.gather(*[
+                self.handle_agent_request(
+                    agent_name=agent_name,
+                    prompt=agent_prompt,
+                    thread_id=thread_id,
+                    channel=message.channel,
+                    user_id=message.author.id,
+                    origin_already_persisted=True,
+                    attachments=_attachments,
+                )
+                for agent_name, agent_prompt in dispatch_list
+            ])
         return True
 
     def _resolve_work_dir(self, prompt: str, channel) -> tuple[str, str | None]:
@@ -308,10 +419,11 @@ class Agents(commands.Cog):
         rate_limit_fallback: str | None = None
         placeholder_msg: discord.WebhookMessage | None = None
         last_chunk_edit: float = 0.0
+        last_streamed_text: str = ""  # last text seen by on_chunk — fallback save on interruption
         research_queries: list[str] = []
         private_wiki_pages: list[str] = []  # pages written as drafts — get promote buttons
 
-        lock = self.bot._get_lock(thread_id)
+        lock = self.bot._get_lock(f"{thread_id}:{agent_name}")
         async with lock:
             if depth == 0 and not origin_already_persisted:
                 await self.bot.db.save_message(
@@ -350,7 +462,8 @@ class Agents(commands.Cog):
 
             async def _on_chunk(text: str) -> None:
                 """Update the placeholder message with streaming progress (throttled to 1Hz)."""
-                nonlocal last_chunk_edit
+                nonlocal last_chunk_edit, last_streamed_text
+                last_streamed_text = text  # always capture, used as fallback on interruption
                 if placeholder_msg is None:
                     return
                 now = time.monotonic()
@@ -369,6 +482,11 @@ class Agents(commands.Cog):
 
             try:
                 workspace = await self.bot.db.get_workspace(thread_id, agent_name)
+                cli_session_id = None
+                workspace_for_prompt = workspace
+                if agent_name in ("codex", "claude"):
+                    cli_session_id, _ = self._parse_workspace(workspace, agent_name)
+                    workspace_for_prompt = self._workspace_without_session(workspace, agent_name)
                 channel_id_str = str(resolve_channel_id(channel))
                 mission = self.bot._get_channel_mission(channel_id_str, agent_name)
 
@@ -396,7 +514,6 @@ class Agents(commands.Cog):
                             )
 
                     # --- Agent call ---
-                    # Hook point: add custom agent routing logic here
 
                     if agent_name == "local-agent":
                         # Local agent relay path — system prompt is owned by the backend.
@@ -452,21 +569,47 @@ class Agents(commands.Cog):
                             call_kwargs["on_chunk"] = _on_chunk
                         if agent_name == "codex" and activity_timeout_override:
                             call_kwargs["activity_timeout"] = activity_timeout_override
-                        result = await agent.call(
-                            history,
-                            system_prompt,
-                            mission=mission,
-                            workspace=workspace,
-                            work_dir=work_dir,
-                            timeout=(
-                                agent_config.get("timeout_extended")
-                                if use_extended_timeout
-                                else None
-                            ),
-                            **call_kwargs,
-                        )
+                        call_timeout = agent_config.get("timeout_extended") if use_extended_timeout else None
 
-                    self._active_agents.pop(str(channel.id), None)
+                        # Resume existing session if available, otherwise fresh call.
+                        if cli_session_id and agent_name in ("codex", "claude"):
+                            try:
+                                # Prepend wiki context to resumed prompt — resume()
+                                # doesn't take a system_prompt param.
+                                resume_prompt = history[-1]["content"]
+                                if wiki_context:
+                                    resume_prompt = (
+                                        f"[Wiki Context]\n{wiki_context}\n\n---\n\n{resume_prompt}"
+                                    )
+                                resume_kwargs = {"work_dir": work_dir, "timeout": call_timeout, "on_chunk": _on_chunk}
+                                if agent_name == "codex" and activity_timeout_override:
+                                    resume_kwargs["activity_timeout"] = activity_timeout_override
+                                result = await agent.resume(
+                                    cli_session_id,
+                                    resume_prompt,
+                                    **resume_kwargs,
+                                )
+                            except AgentOfflineError:
+                                log.warning(
+                                    "%s resume failed (thread=%s, session=%s); falling back to fresh call",
+                                    agent_name,
+                                    thread_id,
+                                    cli_session_id,
+                                    exc_info=True,
+                                )
+                                result = await agent.call(
+                                    history, system_prompt,
+                                    mission=mission, workspace=workspace_for_prompt, work_dir=work_dir,
+                                    timeout=call_timeout,
+                                    **call_kwargs,
+                                )
+                        else:
+                            result = await agent.call(
+                                history, system_prompt,
+                                mission=mission, workspace=workspace_for_prompt, work_dir=work_dir,
+                                timeout=call_timeout,
+                                **call_kwargs,
+                            )
 
                     if isinstance(result, tuple):
                         response_text, metadata = result
@@ -477,6 +620,14 @@ class Agents(commands.Cog):
                     else:
                         response_text = result
                         metadata = {}
+                    # Persist CLI session ID for resumable agents
+                    if agent_name in ("codex", "claude"):
+                        _sid_key = "codex_session_id" if agent_name == "codex" else "session_id"
+                        returned_session_id = metadata.get(_sid_key)
+                        if isinstance(returned_session_id, str) and returned_session_id:
+                            workspace = self._workspace_with_session(workspace, agent_name, returned_session_id)
+                            await self.bot.db.upsert_workspace(thread_id, agent_name, workspace)
+                self._active_agents.pop(str(channel.id), None)
 
                 # --- Process special tags ---
 
@@ -757,6 +908,14 @@ class Agents(commands.Cog):
                 await self.bot.db.update_job(job_id, "failed")
                 msg = f"{agent_name.capitalize()} timed out: {e}"
                 log.error(msg)
+                # Save partial streamed response so it appears in future history.
+                if last_streamed_text:
+                    partial = scan_output(last_streamed_text)
+                    if partial:
+                        await self.bot.db.save_message(
+                            thread_id, "assistant",
+                            f"[partial — timed out]\n{partial}",
+                        )
                 if placeholder_msg:
                     try:
                         await placeholder_msg.edit(content=msg)

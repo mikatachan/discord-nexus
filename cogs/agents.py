@@ -26,7 +26,10 @@ import discord
 from discord.ext import commands
 
 from agents.base import AgentOfflineError, AgentRateLimitError, AgentTimeoutError
-from routing.dispatcher import ALL_AGENTS, parse_commands, parse_sectioned_commands, split_stages, resolve_channel_id, should_respond
+from routing.dispatcher import (
+    ALL_AGENTS, parse_commands, parse_sectioned_commands, split_stages,
+    resolve_channel_id, should_respond, expand_list_reference,
+)
 from security.filter import scan_output
 from utils.attachments import ProcessedAttachments, process_attachments
 from utils.chunker import chunk_message
@@ -78,6 +81,32 @@ class Agents(commands.Cog):
         self.bot = bot
         # channel_id (str) → agent currently running in that channel
         self._active_agents: dict[str, object] = {}
+
+    # --- list-reference expansion ---
+
+    async def _expand_list_refs(
+        self,
+        stages: list[list[tuple[str, str]]],
+        thread_id: str,
+        channel,
+    ) -> list[list[tuple[str, str]]] | None:
+        """Expand shorthand list references (e.g. 'do (1)') in all stages.
+
+        Returns expanded stages, or None if any reference can't be resolved
+        (in which case an error has already been sent to the channel).
+        """
+        prior_msg = await self.bot.db.get_last_assistant_message(thread_id)
+        expanded: list[list[tuple[str, str]]] = []
+        for stage in stages:
+            expanded_stage: list[tuple[str, str]] = []
+            for agent_name, prompt in stage:
+                new_prompt, error = expand_list_reference(prompt, prior_msg)
+                if error:
+                    await channel.send(f"⚠️ {error}")
+                    return None
+                expanded_stage.append((agent_name, new_prompt))
+            expanded.append(expanded_stage)
+        return expanded
 
     # --- workspace / session helpers ---
 
@@ -223,6 +252,11 @@ class Agents(commands.Cog):
                 channel_id = resolve_channel_id(message.channel)
                 thread_id = str(message.channel.id)
 
+                # Expand shorthand list references before dispatch.
+                role_stages = await self._expand_list_refs(role_stages, thread_id, message.channel)
+                if role_stages is None:
+                    return True
+
                 # Save full user message once.
                 all_prompts = [p for stage in role_stages for _, p in stage]
                 await self.bot.db.save_message(
@@ -270,6 +304,11 @@ class Agents(commands.Cog):
 
         channel_id = resolve_channel_id(message.channel)
         thread_id = str(message.channel.id)
+
+        # Expand shorthand list references (e.g. "do (1)") before dispatch.
+        stages = await self._expand_list_refs(stages, thread_id, message.channel)
+        if stages is None:
+            return True  # error already sent
 
         # Save the full user message once before any dispatch.
         all_prompts = [p for stage in stages for _, p in stage]

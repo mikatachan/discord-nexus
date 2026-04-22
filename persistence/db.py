@@ -404,6 +404,17 @@ class Database:
         )
         await self._db.commit()
 
+    async def get_last_assistant_message(self, thread_id: str) -> str | None:
+        """Return the content of the most recent assistant message, or None."""
+        cursor = await self._db.execute(
+            "SELECT content FROM conversations "
+            "WHERE thread_id = ? AND role = 'assistant' AND content != '' "
+            "ORDER BY timestamp DESC LIMIT 1",
+            (thread_id,),
+        )
+        row = await cursor.fetchone()
+        return row["content"] if row else None
+
     async def get_history(self, thread_id: str, budget_chars: int) -> list[dict]:
         """Get recent conversation history within char budget."""
         cursor = await self._db.execute(

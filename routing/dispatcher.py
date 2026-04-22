@@ -144,6 +144,70 @@ def parse_sectioned_commands(content: str) -> list[list[tuple[str, str]]]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# List-reference expansion: "do (1)" → full text of numbered item 1
+# ---------------------------------------------------------------------------
+
+_LIST_REF_RE = re.compile(
+    r"^(?:do\s*)?(?:\((\d+)\)|#(\d+)|(?:step|item|task|number|num|no\.?)\s*(\d+)|(\d+))$",
+    re.IGNORECASE,
+)
+
+_NUMBERED_ITEM_RE = re.compile(
+    r"^\s*(\d+)\.\s+(.+?)(?=\n\s*\d+\.\s|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def parse_list_reference(prompt: str) -> int | None:
+    """If prompt is a shorthand reference to a numbered item, return the number. Else None."""
+    m = _LIST_REF_RE.match(prompt.strip())
+    if not m:
+        return None
+    return int(m.group(1) or m.group(2) or m.group(3) or m.group(4))
+
+
+def extract_numbered_items(text: str) -> dict[int, str]:
+    """Extract numbered items from text. Returns {number: item_text}."""
+    items: dict[int, str] = {}
+    for m in _NUMBERED_ITEM_RE.finditer(text):
+        num = int(m.group(1))
+        item_text = m.group(2).strip()
+        items[num] = item_text
+    return items
+
+
+def expand_list_reference(prompt: str, prior_message: str | None) -> tuple[str, str | None]:
+    """Try to expand a shorthand list reference using a prior message.
+
+    Returns:
+        (expanded_prompt, error_or_none)
+        - If expansion succeeds: (full_item_text, None)
+        - If no list reference detected: (original_prompt, None)
+        - If reference detected but can't resolve: (original_prompt, error_message)
+    """
+    ref_num = parse_list_reference(prompt)
+    if ref_num is None:
+        return prompt, None
+
+    if not prior_message:
+        return prompt, f"You referenced item {ref_num}, but there's no prior message to pull from."
+
+    items = extract_numbered_items(prior_message)
+    if not items:
+        return prompt, (
+            f"You referenced item {ref_num}, but I couldn't find a numbered list in the last message."
+        )
+
+    if ref_num not in items:
+        available = ", ".join(str(n) for n in sorted(items.keys()))
+        return prompt, (
+            f"You referenced item {ref_num}, but the list only has items: {available}"
+        )
+
+    return items[ref_num], None
+
+
 def resolve_channel_id(channel) -> int:
     """Resolve thread→parent channel ID for config lookup.
 

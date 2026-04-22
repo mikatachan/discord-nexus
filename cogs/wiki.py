@@ -569,7 +569,7 @@ class WikiCog(commands.Cog):
         elif action_val == "promote":
             if not page:
                 await interaction.followup.send(
-                    "Usage: `/wiki-private promote page:<page-name>`"
+                    "Usage: `/wiki-private action:promote page:<page-name>`"
                 )
                 return
             if wiki is None:
@@ -587,7 +587,7 @@ class WikiCog(commands.Cog):
         elif action_val == "reject":
             if not page:
                 await interaction.followup.send(
-                    "Usage: `/wiki-private reject page:<page-name>`"
+                    "Usage: `/wiki-private action:reject page:<page-name>`"
                 )
                 return
             if wiki is None:

@@ -139,6 +139,8 @@ codex:
   inference_backend: cloud
   display_name: Codex
   timeout: 360
+  timeout_extended: 1800       # used with --long flag
+  activity_timeout: 1200       # max silence before assuming hung; override per-command with -t <seconds>
   avatar_url: ""
 
   system_prompt: |

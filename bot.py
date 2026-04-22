@@ -43,6 +43,7 @@ from utils.log import setup_logging
 load_dotenv(get_repo_root() / ".env")
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+ATTACHMENTS_TEMP_DIR = os.path.join(DATA_DIR, "temp", "attachments")
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 setup_logging(LOG_DIR)
 log = logging.getLogger("discord-nexus")
@@ -113,6 +114,7 @@ class NexusBot(discord_commands.Bot):
         # Codex CLI (required for /codex)
         self.agents["codex"] = CodexAgent(
             timeout=config.get("codex", {}).get("timeout", 120),
+            activity_timeout=config.get("codex", {}).get("activity_timeout", 300),
         )
 
         # Local LLM agent — choose your backend:
@@ -180,6 +182,7 @@ class NexusBot(discord_commands.Bot):
         }
 
         self._webhooks: dict[tuple[int, str], discord.Webhook] = {}
+        self.attachments_temp_dir = ATTACHMENTS_TEMP_DIR
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._log_last_sent = 0.0
         self._active_tasks: dict[str, asyncio.Task] = {}  # message_id -> dispatch task

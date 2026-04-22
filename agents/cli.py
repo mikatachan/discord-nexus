@@ -295,15 +295,17 @@ class ClaudeAgent(BaseAgent):
 class CodexAgent(BaseAgent):
     """Codex CLI agent via stdin pipe to `codex exec`."""
 
-    def __init__(self, timeout: int = 120, work_dir: str | None = None):
+    def __init__(self, timeout: int = 120, work_dir: str | None = None, activity_timeout: int = 300):
         super().__init__(name="Codex", timeout=timeout)
         self.work_dir = work_dir
+        self.activity_timeout = activity_timeout
         self._current_proc: asyncio.subprocess.Process | None = None
 
     async def call(self, messages: list[dict], system_prompt: str,
                    mission: str = "", workspace: str = "",
                    work_dir: str | None = None,
                    timeout: int | None = None,
+                   activity_timeout: int | None = None,
                    on_chunk=None) -> tuple[str, dict]:
         prompt = self._build_prompt(messages, system_prompt, mission=mission, workspace=workspace)
         effective_dir = work_dir or self.work_dir
@@ -340,9 +342,9 @@ class CodexAgent(BaseAgent):
 
             # Read JSONL events line by line.
             # With --json, Codex emits events during tool calls, but goes silent during model API
-            # response synthesis (same prefill problem as HTTP relays). 300s gives headroom for slow
-            # API responses while still catching genuine subprocess hangs.
-            _ACTIVITY_TIMEOUT = 300
+            # response synthesis (or during long-running shell commands like gradle). Configurable
+            # via activity_timeout on the agent instance, or per-invocation override (e.g. -t flag).
+            _ACTIVITY_TIMEOUT = activity_timeout or self.activity_timeout
             loop = asyncio.get_event_loop()
             deadline = loop.time() + effective_timeout
             last_activity = loop.time()

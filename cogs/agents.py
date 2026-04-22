@@ -28,7 +28,9 @@ from discord.ext import commands
 from agents.base import AgentOfflineError, AgentRateLimitError, AgentTimeoutError
 from routing.dispatcher import ALL_AGENTS, parse_commands, resolve_channel_id, should_respond
 from security.filter import scan_output
+from utils.attachments import ProcessedAttachments, process_attachments
 from utils.chunker import chunk_message
+from utils.confirm import PrivateWikiPromoteView
 from utils.log import set_correlation, clear_correlation
 
 log = logging.getLogger("discord-nexus")
@@ -82,6 +84,13 @@ class Agents(commands.Cog):
 
         Returns True if any agent was dispatched (consumed the message).
         """
+        # Process attachments once — shared across all routing paths below.
+        _attachments: ProcessedAttachments | None = None
+        if message.attachments:
+            _attachments = await process_attachments(
+                message, self.bot.attachments_temp_dir
+            )
+
         # --- @team → all agents in parallel ---
         team_role_id = getattr(self.bot, "_team_role_id", None)
         if team_role_id and message.role_mentions:
@@ -90,6 +99,8 @@ class Agents(commands.Cog):
                 for role in message.role_mentions:
                     content = content.replace(role.mention, "")
                 prompt = content.strip()
+                if _attachments and _attachments.text_block:
+                    prompt = (prompt + "\n\n" + _attachments.text_block).strip()
                 if not prompt:
                     await message.channel.send("Usage: @team <your question>")
                     return True
@@ -107,6 +118,7 @@ class Agents(commands.Cog):
                             thread_id=thread_id,
                             channel=message.channel,
                             user_id=message.author.id,
+                            attachments=_attachments,
                         )
                         for agent_name in active_agents
                     ])
@@ -127,6 +139,8 @@ class Agents(commands.Cog):
                 for mention in message.role_mentions:
                     content = content.replace(mention.mention, "")
                 prompt = content.strip()
+                if _attachments and _attachments.text_block:
+                    prompt = (prompt + "\n\n" + _attachments.text_block).strip()
                 if not prompt:
                     names = " / ".join(f"@{a.capitalize()}" for a in role_agents)
                     await message.channel.send(f"Usage: @{names} <your question>")
@@ -149,6 +163,7 @@ class Agents(commands.Cog):
                             thread_id=thread_id,
                             channel=message.channel,
                             user_id=message.author.id,
+                            attachments=_attachments,
                         )
                         for agent_name in active_agents
                     ])
@@ -158,6 +173,9 @@ class Agents(commands.Cog):
         agents, prompt = parse_commands(message.content)
         if not agents:
             return False
+
+        if _attachments and _attachments.text_block:
+            prompt = (prompt + "\n\n" + _attachments.text_block).strip() if prompt else _attachments.text_block
 
         if not prompt:
             names = ", ".join(f"`!{a}`" for a in agents)
@@ -189,6 +207,7 @@ class Agents(commands.Cog):
                 thread_id=thread_id,
                 channel=message.channel,
                 user_id=message.author.id,
+                attachments=_attachments,
             )
             for agent_name in active_agents
         ]
@@ -233,6 +252,7 @@ class Agents(commands.Cog):
         work_dir: str | None = None,
         message_id: str | None = None,
         origin_already_persisted: bool = False,
+        attachments: ProcessedAttachments | None = None,
     ):
         """Handle a request for any agent.
 
@@ -256,6 +276,14 @@ class Agents(commands.Cog):
         if agent_name in ("claude", "codex") and re.search(r"--long\b", prompt):
             prompt = re.sub(r"\s*--long\b", "", prompt).strip()
             use_extended_timeout = True
+
+        # Detect and strip -t <seconds> flag for per-command activity timeout (Codex only).
+        activity_timeout_override: int | None = None
+        if agent_name == "codex":
+            t_match = re.search(r"-t\s+(\d+)", prompt)
+            if t_match:
+                activity_timeout_override = int(t_match.group(1))
+                prompt = re.sub(r"\s*-t\s+\d+", "", prompt).strip()
 
         # Enforce handoff depth limit
         if depth > 0 and depth >= self.MAX_HANDOFF_DEPTH:
@@ -281,6 +309,7 @@ class Agents(commands.Cog):
         placeholder_msg: discord.WebhookMessage | None = None
         last_chunk_edit: float = 0.0
         research_queries: list[str] = []
+        private_wiki_pages: list[str] = []  # pages written as drafts — get promote buttons
 
         lock = self.bot._get_lock(thread_id)
         async with lock:
@@ -379,9 +408,16 @@ class Agents(commands.Cog):
                         if memory_block:
                             ctx_block += f"\n\nmemory:\n{memory_block}"
                         if relay_messages and relay_messages[-1]["role"] == "user":
-                            relay_messages[-1]["content"] = (
-                                relay_messages[-1]["content"] + "\n\n" + ctx_block
-                            )
+                            last_text = relay_messages[-1]["content"] + "\n\n" + ctx_block
+                            vision_blocks = (attachments.vision_blocks if attachments else [])
+                            if vision_blocks:
+                                # OpenAI multimodal format: content is a list of blocks.
+                                relay_messages[-1]["content"] = [
+                                    {"type": "text", "text": last_text},
+                                    *vision_blocks,
+                                ]
+                            else:
+                                relay_messages[-1]["content"] = last_text
                         if hasattr(agent, "call_streaming"):
                             result = await agent.call_streaming(
                                 relay_messages, "", on_chunk=_on_chunk,
@@ -414,6 +450,8 @@ class Agents(commands.Cog):
                         call_kwargs = {}
                         if agent_name in ("claude", "codex"):
                             call_kwargs["on_chunk"] = _on_chunk
+                        if agent_name == "codex" and activity_timeout_override:
+                            call_kwargs["activity_timeout"] = activity_timeout_override
                         result = await agent.call(
                             history,
                             system_prompt,
@@ -576,9 +614,9 @@ class Agents(commands.Cog):
                                         author="local-agent",
                                         aliases=pw_aliases,
                                     )
+                                    private_wiki_pages.append(pw_page_name)
                                     response_text += (
-                                        f"\n*[Private wiki: `{pw_page_name}` saved as draft — "
-                                        f"use `/wiki-private promote page:{pw_page_name}` to publish]*"
+                                        f"\n*[Private wiki: `{pw_page_name}` saved as draft]*"
                                     )
                                 else:
                                     response_text += (
@@ -623,6 +661,16 @@ class Agents(commands.Cog):
                     channel, agent_name, placeholder_msg, clean_response
                 )
                 placeholder_msg = None
+
+                # Send Promote / Reject buttons for each private wiki draft written this turn.
+                wiki = getattr(self.bot, "wiki", None)
+                for pw_page in private_wiki_pages:
+                    view = PrivateWikiPromoteView(
+                        page_name=pw_page, wiki=wiki, author_id=user_id
+                    )
+                    await channel.send(
+                        f"*Promote private draft `{pw_page}` to published?*", view=view
+                    )
 
                 if handoff_agents:
                     targets = ", ".join(t.capitalize() for t, _ in handoff_agents)
